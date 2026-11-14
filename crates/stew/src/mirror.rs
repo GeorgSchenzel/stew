@@ -1,6 +1,7 @@
 //! The hub's bare mirror of the artifacts repo: claiming `stew/<id>` and `ls --all`.
 //!
-//! Claiming makes a stew's first commit (`stew.yaml`, and `BRIEF.md` with a brief) with
+//! Claiming makes a stew's first commit (`stew.yaml`, `README.md`, `LOG.md`, and `BRIEF.md`
+//! with a brief) with
 //! `commit-tree`, without a checkout, and pushes it only if the branch doesn't exist yet
 //! (`--force-with-lease=<ref>:`). A rejected push means the id is taken: retry with new
 //! random chars. A creation that fails later leaves the branch as its record.
@@ -13,7 +14,7 @@ use stew_proto::{StewMeta, Tracked};
 
 use crate::error::{Result, fail};
 use crate::git::{git, git_ok, git_with};
-use crate::id;
+use crate::{id, readme};
 
 /// How many ids to try before giving up.
 const CLAIM_ATTEMPTS: usize = 8;
@@ -129,7 +130,11 @@ impl Mirror {
 
     fn first_commit(&self, meta: &StewMeta, brief: Option<&str>) -> Result<String> {
         let mut tree = String::new();
-        let mut files = vec![("stew.yaml", meta_yaml(meta))];
+        let mut files = vec![
+            ("stew.yaml", meta_yaml(meta)),
+            ("README.md", readme::initial_readme(meta)),
+            ("LOG.md", readme::initial_log(meta)),
+        ];
         if let Some(b) = brief {
             files.push(("BRIEF.md", b.to_string()));
         }
@@ -165,47 +170,59 @@ impl Mirror {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
-    /// Every tracked stew, most recent first. With `search`, those whose id, title or
-    /// any notes file contains it (case-insensitive). Unreadable `stew.yaml` files are
-    /// skipped with a warning.
-    pub fn tracked(&self, search: Option<&str>) -> Result<(Vec<Tracked>, Vec<String>)> {
+    /// Tracked stews, most recent first: the open ones, or with `closed` the closed
+    /// ones. With `search`, those of either kind whose id, title or any notes file
+    /// contains it (case-insensitive). Unreadable `stew.yaml` files are skipped with a
+    /// warning.
+    pub fn tracked(
+        &self,
+        search: Option<&str>,
+        closed: bool,
+    ) -> Result<(Vec<Tracked>, Vec<String>)> {
         let listing = git(
             &self.dir,
             [
                 "for-each-ref",
                 "--sort=-committerdate",
-                "--format=%(refname:lstrip=3)%00%(committerdate:unix)%00%(contents:subject)",
+                "--format=%(refname:lstrip=3) %(committerdate:unix)",
                 "refs/heads/stew/",
             ],
         )?;
-        let mut rows = Vec::new();
-        for line in listing.lines() {
-            let mut parts = line.splitn(3, '\0');
-            let (Some(id), Some(time), Some(subject)) = (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            rows.push((
-                id.to_string(),
-                time.parse::<i64>().unwrap_or(0),
-                subject.to_string(),
-            ));
-        }
-        let ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
-        let metas = self.read_metas(&ids)?;
+        let rows: Vec<(&str, i64)> = listing
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(id, time)| (id, time.parse().unwrap_or(0)))
+            .collect();
+        let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
+        let files = self.read_files(&ids, &["stew.yaml", "README.md"])?;
+        let search = search.map(str::trim).filter(|t| !t.is_empty());
         let mut warnings = Vec::new();
         let mut out = Vec::new();
-        for ((id, updated, status), meta) in rows.iter().zip(metas) {
-            match meta {
-                Ok(meta) => out.push(Tracked {
-                    meta,
-                    updated: *updated,
-                    status: status.clone(),
-                }),
-                Err(e) => warnings.push(format!("stew/{id}: {e}")),
+        for ((id, updated), mut found) in rows.iter().zip(files) {
+            let readme = found.pop().flatten();
+            let meta = match found.pop().flatten() {
+                Some(text) => parse_meta(&text),
+                None => Err(fail!("no stew.yaml")),
+            };
+            let meta = match meta {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!("stew/{id}: {e}"));
+                    continue;
+                }
+            };
+            if search.is_none() && meta.is_closed() != closed {
+                continue;
             }
+            let summary = readme::summarize(readme.as_deref().unwrap_or_default());
+            out.push(Tracked {
+                meta,
+                updated: *updated,
+                description: summary.description,
+                now: summary.now,
+            });
         }
-        if let Some(term) = search.map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(term) = search {
             let lower = term.to_lowercase();
             let hit = |t: &Tracked| {
                 t.meta.id.contains(&lower) || t.meta.title.to_lowercase().contains(&lower)
@@ -221,15 +238,18 @@ impl Mirror {
         Ok((out, warnings))
     }
 
-    /// Each id's `stew.yaml`, in one `cat-file --batch`.
-    fn read_metas(&self, ids: &[&str]) -> Result<Vec<Result<StewMeta>>> {
+    /// For each id, each of `names` on its branch (`None` when missing), in one
+    /// `cat-file --batch`.
+    fn read_files(&self, ids: &[&str], names: &[&str]) -> Result<Vec<Vec<Option<String>>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let input: String = ids
-            .iter()
-            .map(|id| format!("{}:stew.yaml\n", branch(id)))
-            .collect();
+        let mut input = String::new();
+        for id in ids {
+            for name in names {
+                input.push_str(&format!("{}:{name}\n", branch(id)));
+            }
+        }
         let out = git_with(
             &self.dir,
             ["cat-file", "--batch"],
@@ -237,28 +257,38 @@ impl Mirror {
             Some(input.as_bytes()),
         )?;
         let mut rest = &out[..];
-        let mut metas = Vec::new();
+        let mut all = Vec::new();
         for _ in ids {
-            let nl = rest
-                .iter()
-                .position(|&b| b == b'\n')
-                .ok_or_else(|| fail!("short cat-file output"))?;
-            let header = String::from_utf8_lossy(&rest[..nl]).to_string();
-            rest = &rest[nl + 1..];
-            let mut words = header.split(' ');
-            match (words.next(), words.next(), words.next()) {
-                (Some(_), Some("blob"), Some(size)) => {
-                    let size: usize = size.parse().map_err(|_| fail!("bad cat-file header"))?;
-                    let body = rest
-                        .get(..size)
-                        .ok_or_else(|| fail!("short cat-file output"))?;
-                    metas.push(parse_meta(&String::from_utf8_lossy(body)));
-                    rest = rest.get(size + 1..).unwrap_or_default();
+            let mut files = Vec::new();
+            for _ in names {
+                let nl = rest
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .ok_or_else(|| fail!("short cat-file output"))?;
+                let header = String::from_utf8_lossy(&rest[..nl]).to_string();
+                rest = &rest[nl + 1..];
+                let mut words = header.split(' ');
+                match (words.next(), words.next(), words.next()) {
+                    (Some(_), Some("blob"), Some(size)) => {
+                        let size: usize = size.parse().map_err(|_| fail!("bad cat-file header"))?;
+                        let body = rest
+                            .get(..size)
+                            .ok_or_else(|| fail!("short cat-file output"))?;
+                        files.push(Some(String::from_utf8_lossy(body).into_owned()));
+                        rest = rest.get(size + 1..).unwrap_or_default();
+                    }
+                    // `<name> missing`, or not a blob
+                    (Some(_), Some(_), Some(size)) => {
+                        let size: usize = size.parse().unwrap_or(0);
+                        rest = rest.get(size + 1..).unwrap_or_default();
+                        files.push(None);
+                    }
+                    _ => files.push(None),
                 }
-                _ => metas.push(Err(fail!("no stew.yaml"))),
             }
+            all.push(files);
         }
-        Ok(metas)
+        Ok(all)
     }
 
     /// The ids (of those given) whose notes contain `term`.

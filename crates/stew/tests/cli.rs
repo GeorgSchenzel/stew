@@ -98,6 +98,8 @@ fn meta(title: &str) -> StewMeta {
         title: title.into(),
         from: None,
         created: "2026-11-14".into(),
+        state: None,
+        closed: None,
         repos: vec![],
     }
 }
@@ -127,20 +129,65 @@ fn ls_all_through_the_daemon() {
         .collect();
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+    assert_eq!(v[0]["now"], serde_json::json!([]));
+
+    // an agent in `a` writes its README; `b` gets closed
+    for (id, dir) in [(&a, "wa"), (&b, "wb")] {
+        env.git(
+            &env.base,
+            &["clone", "-q", "-b", &format!("stew/{id}"), &url, dir],
+        );
+    }
+    let wa = env.base.join("wa");
+    fs::write(
+        wa.join("README.md"),
+        "# Port forwarding\n\nPorts per box.\n\n## Now\n- loopback IPs: done\n- waiting: Georg applies the units\n",
+    )
+    .unwrap();
+    env.git(&wa, &["commit", "-q", "-am", "now"]);
+    env.git(&wa, &["push", "-q"]);
+    let wb = env.base.join("wb");
+    let yaml = fs::read_to_string(wb.join("stew.yaml")).unwrap();
+    fs::write(
+        wb.join("stew.yaml"),
+        yaml.replace("repos:", "state: closed\nclosed: 2026-11-15\nrepos:"),
+    )
+    .unwrap();
+    env.git(&wb, &["commit", "-q", "-am", "closed"]);
+    env.git(&wb, &["push", "-q"]);
+
+    let r = env.stew(&["ls", "--all"], &d.socket);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let lines: Vec<_> = r.stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{}", r.stdout);
+    assert!(lines[0].starts_with(&a) && lines[0].contains("Port forwarding"));
     assert_eq!(
-        v[0]["status"].as_str().unwrap().split(": ").next(),
-        Some("created")
+        &lines[1..],
+        [
+            "    Ports per box.",
+            "    - loopback IPs: done",
+            "    - waiting: Georg applies the units"
+        ]
     );
 
-    let r = env.stew(&["ls", "--all", "forwarding"], &d.socket);
+    let r = env.stew(&["ls", "--all", "--closed"], &d.socket);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(
-        r.stdout.starts_with(&a) && r.stdout.contains("Port forwarding"),
+        r.stdout.starts_with(&b) && r.stdout.trim_end().ends_with("closed"),
         "{}",
         r.stdout
     );
-    assert!(r.stdout.contains("created: Port forwarding"));
     assert_eq!(r.stdout.lines().count(), 1);
+
+    let r = env.stew(&["ls", "--waiting"], &d.socket);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{a}  waiting: Georg applies the units\n"));
+
+    // a search covers closed stews too
+    let r = env.stew(&["ls", "--all", "something"], &d.socket);
+    assert!(r.stdout.starts_with(&b), "{}", r.stdout);
+    let r = env.stew(&["ls", "--all", "forwarding"], &d.socket);
+    assert!(r.stdout.starts_with(&a), "{}", r.stdout);
     assert!(
         env.home
             .join(".local/share/stew/artifacts.git/HEAD")
@@ -155,7 +202,7 @@ fn ls_all_through_the_daemon() {
     .unwrap();
     let r = env.stew(&["ls", "--all"], &d.socket);
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(r.stdout.lines().count(), 2);
+    assert_eq!(r.stdout.lines().count(), 4);
     assert!(r.stderr.contains("warning: cannot fetch"), "{}", r.stderr);
 }
 

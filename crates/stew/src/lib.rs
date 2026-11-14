@@ -8,6 +8,7 @@ pub mod git;
 pub mod id;
 pub mod mirror;
 pub mod paths;
+pub mod readme;
 pub mod refs;
 pub mod state;
 pub mod url;

@@ -73,7 +73,7 @@ impl Hub {
                     refs::resolve_new(&entries, base.as_deref(), here.as_ref())?;
                 Ok(Reply::Resolved { repos, warnings })
             }
-            Call::LsAll { search } => {
+            Call::LsAll { search, closed } => {
                 let mirror = self.mirror(&config)?;
                 let _lock = self.mirror.lock().unwrap_or_else(|p| p.into_inner());
                 mirror.ensure()?;
@@ -82,7 +82,7 @@ impl Hub {
                 if let Err(e) = mirror.fetch() {
                     warnings.push(format!("{e} (showing the last fetched state)"));
                 }
-                let (stews, more) = mirror.tracked(search.as_deref())?;
+                let (stews, more) = mirror.tracked(search.as_deref(), closed)?;
                 warnings.extend(more);
                 Ok(Reply::Tracked { stews, warnings })
             }

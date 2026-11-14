@@ -20,6 +20,8 @@ fn meta(title: &str) -> StewMeta {
         title: title.into(),
         from: Some("parent-abcd".into()),
         created: "2026-11-14".into(),
+        state: None,
+        closed: None,
         repos: vec![RepoRecord {
             name: "a".into(),
             remote: "https://h/x/a".into(),
@@ -126,7 +128,15 @@ fn claims_a_branch_and_retries_a_clash() {
     );
     assert_eq!(
         env.git(&remote, &["ls-tree", "--name-only", &refname]),
-        "BRIEF.md\nstew.yaml"
+        "BRIEF.md\nLOG.md\nREADME.md\nstew.yaml"
+    );
+    assert_eq!(
+        env.git(&remote, &["show", &format!("{refname}:README.md")]),
+        "# Port forwarding\n\n## Now"
+    );
+    assert_eq!(
+        env.git(&remote, &["show", &format!("{refname}:LOG.md")]),
+        "# Log\n- 2026-11-14 created from parent-abcd"
     );
     assert_eq!(
         env.git(&remote, &["show", &format!("{refname}:BRIEF.md")]),
@@ -156,7 +166,7 @@ fn claims_a_branch_and_retries_a_clash() {
             &remote,
             &["ls-tree", "--name-only", "refs/heads/stew/x-bbbb"]
         ),
-        "stew.yaml"
+        "LOG.md\nREADME.md\nstew.yaml"
     );
     // the first one's commit is untouched
     assert_eq!(
@@ -208,6 +218,7 @@ fn lists_tracked_stews() {
     let maker = Mirror::new(env.base.join("maker/artifacts.git"), url.clone());
     let old = maker.claim(&meta("Old work"), None).unwrap();
     let new = maker.claim(&meta("Zoo keeper"), None).unwrap();
+    let done = maker.claim(&meta("Finished thing"), None).unwrap();
 
     // an agent writes notes in `old` later
     let clone = env.base.join("clone");
@@ -224,7 +235,12 @@ fn lists_tracked_stews() {
         ],
     );
     std::fs::write(clone.join("findings.md"), "The ZEBRA is striped.\n").unwrap();
-    env.git(&clone, &["add", "findings.md"]);
+    std::fs::write(
+        clone.join("README.md"),
+        "# Old work\n\nWhat this is\nabout.\n\n## Now\n- parsing: done\n- waiting: Georg picks a name\n",
+    )
+    .unwrap();
+    env.git(&clone, &["add", "findings.md", "README.md"]);
     let later = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -237,6 +253,20 @@ fn lists_tracked_stews() {
         &[("GIT_COMMITTER_DATE", &date), ("GIT_AUTHOR_DATE", &date)],
     );
     env.git(&clone, &["push", "-q"]);
+    // `done` is closed
+    let closer = env.base.join("closer");
+    env.git(
+        &env.base,
+        &["clone", "-q", "-b", &format!("stew/{done}"), &url, "closer"],
+    );
+    let yaml = std::fs::read_to_string(closer.join("stew.yaml")).unwrap();
+    std::fs::write(
+        closer.join("stew.yaml"),
+        yaml.replace("repos:", "state: closed\nclosed: 2026-11-15\nrepos:"),
+    )
+    .unwrap();
+    env.git(&closer, &["commit", "-q", "-am", "closed"]);
+    env.git(&closer, &["push", "-q"]);
     // and a branch without a readable stew.yaml
     env.git(&clone, &["checkout", "-q", "--orphan", "broken"]);
     std::fs::write(clone.join("stew.yaml"), "id: [\n").unwrap();
@@ -250,12 +280,19 @@ fn lists_tracked_stews() {
     let hub = Mirror::new(env.base.join("hub/artifacts.git"), url);
     hub.ensure().unwrap();
     hub.fetch().unwrap();
-    let (all, warnings) = hub.tracked(None).unwrap();
+    let (all, warnings) = hub.tracked(None, false).unwrap();
     let ids: Vec<_> = all.iter().map(|t| t.meta.id.as_str()).collect();
     assert_eq!(ids[0], old, "most recent first: {ids:?}");
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&new.as_str()));
-    assert_eq!(all[0].status, "B1 wip: findings");
+    assert_eq!(all[0].description, "What this is about.");
+    assert_eq!(all[0].now, ["parsing: done", "waiting: Georg picks a name"]);
+    assert_eq!(
+        all[0].waiting().collect::<Vec<_>>(),
+        ["waiting: Georg picks a name"]
+    );
+    let fresh = all.iter().find(|t| t.meta.id == new).unwrap();
+    assert!(fresh.description.is_empty() && fresh.now.is_empty());
     assert_eq!(all[0].updated, later as i64);
     assert_eq!(all[0].meta.title, "Old work");
     assert!(
@@ -263,14 +300,22 @@ fn lists_tracked_stews() {
         "{warnings:?}"
     );
 
+    let (closed, _) = hub.tracked(None, true).unwrap();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].meta.id, done);
+    assert!(closed[0].meta.is_closed());
+    assert_eq!(closed[0].meta.closed.as_deref(), Some("2026-11-15"));
+
     let search = |term| {
-        let (hits, _) = hub.tracked(Some(term)).unwrap();
+        let (hits, _) = hub.tracked(Some(term), false).unwrap();
         hits.into_iter().map(|t| t.meta.id).collect::<Vec<_>>()
     };
     assert_eq!(search("zebra"), [old.as_str()]);
     assert_eq!(search("zoo"), [new.as_str()]);
     assert_eq!(search(&new[new.len() - 4..]), [new.as_str()]);
     assert!(search("nothing like it").is_empty());
+    // a search covers closed stews too
+    assert_eq!(search("finished"), [done.as_str()]);
     assert_eq!(search("  ").len(), 2);
 
     // a deleted branch disappears at the next fetch
@@ -279,5 +324,5 @@ fn lists_tracked_stews() {
         &["update-ref", "-d", &format!("refs/heads/stew/{new}")],
     );
     hub.fetch().unwrap();
-    assert_eq!(hub.tracked(None).unwrap().0.len(), 1);
+    assert_eq!(hub.tracked(None, false).unwrap().0.len(), 1);
 }

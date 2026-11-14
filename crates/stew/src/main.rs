@@ -20,10 +20,16 @@ struct Cli {
 enum Cmd {
     /// List stews, most recent first
     Ls {
-        /// Every tracked stew, from the artifacts repo
+        /// Every open tracked stew, from the artifacts repo
         #[arg(long)]
         all: bool,
-        /// With --all: only stews whose id, title or notes contain this
+        /// With --all: the closed ones instead
+        #[arg(long)]
+        closed: bool,
+        /// Every Now line of an open stew that needs a human (`waiting:`, `blocked:`)
+        #[arg(long, conflicts_with_all = ["all", "closed", "search"])]
+        waiting: bool,
+        /// With --all: open and closed stews whose id, title or notes contain this
         search: Option<String>,
         #[arg(long)]
         json: bool,
@@ -55,29 +61,51 @@ fn run(cli: Cli) -> Result<()> {
             let listener = daemon::bind(&socket)?;
             daemon::serve(hub, listener, socket)
         }
-        Cmd::Ls { all, search, json } => {
-            if !all {
+        Cmd::Ls {
+            all,
+            closed,
+            waiting,
+            search,
+            json,
+        } => {
+            if !(all || closed || waiting) {
                 return Err(Error::Fail(
                     "`stew ls` without --all is not built yet (B2); use --all".into(),
                 ));
             }
-            match call(&paths, Call::LsAll { search })? {
-                Reply::Tracked { stews, warnings } => {
-                    for w in &warnings {
-                        eprintln!("stew: warning: {w}");
-                    }
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&stews).expect("serializes")
-                        );
-                    } else {
-                        print!("{}", table(&stews));
-                    }
-                    Ok(())
-                }
-                other => Err(unexpected(other)),
+            let Reply::Tracked { stews, warnings } = call(&paths, Call::LsAll { search, closed })?
+            else {
+                return Err(Error::Fail("unexpected reply from the daemon".into()));
+            };
+            for w in &warnings {
+                eprintln!("stew: warning: {w}");
             }
+            if waiting {
+                let lines: Vec<(&str, &str)> = stews
+                    .iter()
+                    .flat_map(|t| t.waiting().map(|l| (t.meta.id.as_str(), l)))
+                    .collect();
+                if json {
+                    let v: Vec<_> = lines
+                        .iter()
+                        .map(|(id, line)| serde_json::json!({"id": id, "line": line}))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&v).expect("serializes"));
+                } else {
+                    let w = lines.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+                    for (id, line) in lines {
+                        println!("{id:<w$}  {line}");
+                    }
+                }
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&stews).expect("serializes")
+                );
+            } else {
+                print!("{}", table(&stews));
+            }
+            Ok(())
         }
     }
 }
@@ -97,39 +125,36 @@ fn call(paths: &Paths, call: Call) -> Result<Reply> {
     }
 }
 
-fn unexpected(r: Reply) -> Error {
-    Error::Fail(format!("unexpected reply from the daemon: {r:?}"))
-}
-
+/// Per stew: id, title, age (and `closed`), then its description and Now lines indented.
 fn table(stews: &[Tracked]) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let rows: Vec<[String; 4]> = stews
+    let w0 = stews.iter().map(|t| t.meta.id.len()).max().unwrap_or(0);
+    let w1 = stews
         .iter()
-        .map(|t| {
-            [
-                t.meta.id.clone(),
-                t.meta.title.clone(),
-                age(now - t.updated),
-                t.status.clone(),
-            ]
-        })
-        .collect();
-    let mut widths = [0; 3];
-    for r in &rows {
-        for (w, cell) in widths.iter_mut().zip(r) {
-            *w = (*w).max(cell.chars().count());
-        }
-    }
+        .map(|t| t.meta.title.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
-    for [id, title, age, status] in &rows {
-        out.push_str(&format!(
-            "{id:<w0$}  {title:<w1$}  {age:>w2$}  {status}\n",
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2]
-        ));
+    for t in stews {
+        let mut head = format!(
+            "{:<w0$}  {:<w1$}  {:>4}",
+            t.meta.id,
+            t.meta.title,
+            age(now - t.updated)
+        );
+        if t.meta.is_closed() {
+            head.push_str("  closed");
+        }
+        out.push_str(head.trim_end());
+        out.push('\n');
+        if !t.description.is_empty() {
+            out.push_str(&format!("    {}\n", t.description));
+        }
+        for line in &t.now {
+            out.push_str(&format!("    - {line}\n"));
+        }
     }
     out
 }

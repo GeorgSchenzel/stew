@@ -51,10 +51,13 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         here: Option<Here>,
     },
-    /// Every tracked stew, from the artifacts mirror.
+    /// Tracked stews, from the artifacts mirror: the open ones, or with `closed` the
+    /// closed ones; a search covers both.
     LsAll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        closed: bool,
     },
 }
 
@@ -124,8 +127,27 @@ pub struct StewMeta {
     pub from: Option<String>,
     /// `YYYY-MM-DD`.
     pub created: String,
+    /// Absent means open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Openness>,
+    /// With `state: closed`: when, `YYYY-MM-DD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
     #[serde(default)]
     pub repos: Vec<RepoRecord>,
+}
+
+impl StewMeta {
+    pub fn is_closed(&self) -> bool {
+        self.state == Some(Openness::Closed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Openness {
+    Open,
+    Closed,
 }
 
 /// A repo in the snapshot: catalog name, normalized remote, branch.
@@ -136,15 +158,27 @@ pub struct RepoRecord {
     pub branch: String,
 }
 
-/// A tracked stew as `ls --all` shows it.
+/// A tracked stew as `ls --all` shows it: `stew.yaml` plus what its `README.md` says.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tracked {
     #[serde(flatten)]
     pub meta: StewMeta,
-    /// Unix time of the last commit on its notes branch.
+    /// Unix time of the last commit on its notes branch (for recency).
     pub updated: i64,
-    /// The subject of that commit: the stew's status line.
-    pub status: String,
+    /// README's paragraph on what the stew is about.
+    pub description: String,
+    /// README's `## Now` lines, one per item.
+    pub now: Vec<String>,
+}
+
+impl Tracked {
+    /// The Now lines that need a human (`waiting:`, `blocked:`).
+    pub fn waiting(&self) -> impl Iterator<Item = &str> {
+        self.now
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.starts_with("waiting:") || l.starts_with("blocked:"))
+    }
 }
 
 /// Writes one message as a line.
@@ -190,6 +224,7 @@ mod tests {
     fn request_lines() {
         let req = Request::new(Call::LsAll {
             search: Some("x".into()),
+            closed: false,
         });
         let mut buf = Vec::new();
         send(&mut buf, &req).unwrap();
@@ -219,14 +254,26 @@ mod tests {
                 title: "A".into(),
                 from: None,
                 created: "2026-11-14".into(),
+                state: None,
+                closed: None,
                 repos: vec![],
             },
             updated: 1,
-            status: "s".into(),
+            description: "d".into(),
+            now: vec![
+                "waiting: me".into(),
+                "x: blocked: no".into(),
+                "blocked: y".into(),
+            ],
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["id"], "a-k3fq");
-        assert_eq!(v["status"], "s");
-        assert!(v.get("from").is_none());
+        assert_eq!(v["description"], "d");
+        assert!(v.get("from").is_none() && v.get("state").is_none());
+        assert_eq!(
+            t.waiting().collect::<Vec<_>>(),
+            ["waiting: me", "blocked: y"]
+        );
+        assert!(!t.meta.is_closed());
     }
 }
