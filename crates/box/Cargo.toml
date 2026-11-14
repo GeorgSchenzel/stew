@@ -1,0 +1,12 @@
+[package]
+name = "stew-box"
+description = "The stew client inside a box (installed there as `stew`)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+stew-proto.workspace = true

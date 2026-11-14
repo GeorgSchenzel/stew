@@ -1,0 +1,336 @@
+//! The daemon in the foreground (`stew daemon --socket`) and the CLI as its client.
+
+mod common;
+
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use common::Env;
+use serde_json::Value;
+use stew::mirror::Mirror;
+use stew_proto::{Call, Here, Reply, Request, StewMeta};
+
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// A daemon child; killed by its PID when dropped.
+struct Daemon {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Daemon {
+    fn call(&self, call: Call) -> Reply {
+        stew_proto::call(&self.socket, &Request::new(call)).unwrap()
+    }
+}
+
+trait Stew {
+    fn stew(&self, args: &[&str], socket: &Path) -> Run;
+    fn daemon(&self) -> Daemon;
+    fn artifacts(&self) -> String;
+}
+
+impl Stew for Env {
+    fn stew(&self, args: &[&str], socket: &Path) -> Run {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_stew"));
+        cmd.args(args).current_dir(&self.base);
+        self.envs(&mut cmd);
+        cmd.env("STEW_SOCKET", socket);
+        let out = cmd.output().unwrap();
+        Run {
+            code: out.status.code().unwrap(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    fn daemon(&self) -> Daemon {
+        let socket = self.base.join("run/stew.sock");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_stew"));
+        cmd.args(["daemon", "--socket", socket.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.envs(&mut cmd);
+        let child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&socket).is_err() {
+            assert!(Instant::now() < deadline, "the daemon didn't come up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Daemon { child, socket }
+    }
+
+    /// An empty artifacts repo, set in the config.
+    fn artifacts(&self) -> String {
+        let remote = self.base.join("remotes/notes.git");
+        self.git(
+            &self.base,
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        let url = remote.to_str().unwrap().to_string();
+        self.write(
+            ".config/stew/config.yaml",
+            &format!("artifacts: {url}\nscan: false\n"),
+        );
+        url
+    }
+}
+
+fn meta(title: &str) -> StewMeta {
+    StewMeta {
+        id: String::new(),
+        title: title.into(),
+        from: None,
+        created: "2026-11-14".into(),
+        repos: vec![],
+    }
+}
+
+#[test]
+fn ls_all_through_the_daemon() {
+    let env = Env::new();
+    let url = env.artifacts();
+    let d = env.daemon();
+
+    let r = env.stew(&["ls", "--all"], &d.socket);
+    assert_eq!((r.code, r.stdout.as_str()), (0, ""), "{}", r.stderr);
+
+    // another hub claims; this daemon's mirror sees it at the next fetch
+    let other = Mirror::new(env.base.join("other/artifacts.git"), url.clone());
+    let a = other.claim(&meta("Port forwarding"), None).unwrap();
+    let b = other.claim(&meta("Something else"), None).unwrap();
+
+    let r = env.stew(&["ls", "--all", "--json"], &d.socket);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    let ids: Vec<_> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+    assert_eq!(
+        v[0]["status"].as_str().unwrap().split(": ").next(),
+        Some("created")
+    );
+
+    let r = env.stew(&["ls", "--all", "forwarding"], &d.socket);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(
+        r.stdout.starts_with(&a) && r.stdout.contains("Port forwarding"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("created: Port forwarding"));
+    assert_eq!(r.stdout.lines().count(), 1);
+    assert!(
+        env.home
+            .join(".local/share/stew/artifacts.git/HEAD")
+            .exists()
+    );
+
+    // the remote goes away: the last fetched state, with a warning
+    fs::rename(
+        env.base.join("remotes/notes.git"),
+        env.base.join("remotes/moved.git"),
+    )
+    .unwrap();
+    let r = env.stew(&["ls", "--all"], &d.socket);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout.lines().count(), 2);
+    assert!(r.stderr.contains("warning: cannot fetch"), "{}", r.stderr);
+}
+
+#[test]
+fn errors_reach_the_cli() {
+    let env = Env::new();
+    let d = env.daemon();
+    let r = env.stew(&["ls", "--all"], &d.socket);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("no artifacts repo"), "{}", r.stderr);
+
+    let r = env.stew(&["ls"], &d.socket);
+    assert_eq!(r.code, 1);
+
+    let r = env.stew(&["ls", "--all"], &env.base.join("nobody.sock"));
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("cannot reach the stew daemon"),
+        "{}",
+        r.stderr
+    );
+
+    // a malformed request gets an error reply, and the daemon carries on
+    let conn = UnixStream::connect(&d.socket).unwrap();
+    (&conn).write_all(b"{\"call\":\"no_such\"}\n").unwrap();
+    let mut line = String::new();
+    BufReader::new(&conn).read_line(&mut line).unwrap();
+    assert!(
+        line.contains("\"reply\":\"error\"") && line.contains("bad request"),
+        "{line}"
+    );
+    assert_eq!(
+        d.call(Call::Hello),
+        Reply::Hello {
+            version: stew_proto::VERSION
+        }
+    );
+}
+
+#[test]
+fn catalog_and_refs_over_the_socket() {
+    let env = Env::new();
+    let a = env.remote("a", &["main", "feat"], "main");
+    let b = env.remote("b", &["dev"], "dev");
+    env.write(
+        ".config/stew/repos.yaml",
+        &format!(
+            "a: {}\nwork:\n  b: {}\n  gh: git@github.com:x/dup.git\n",
+            a.display(),
+            b.display()
+        ),
+    );
+    // scanned clones: one new, one the catalog already has
+    for (dir, origin) in [
+        ("tool", "git@github.com:x/tool.git"),
+        ("dup", "https://github.com/x/dup"),
+    ] {
+        let p = env.home.join("projects/repos").join(dir);
+        fs::create_dir_all(&p).unwrap();
+        env.git(&p, &["init", "-q"]);
+        env.git(&p, &["remote", "add", "origin", origin]);
+    }
+    let d = env.daemon();
+
+    let Reply::Repos { repos } = d.call(Call::Repos) else {
+        panic!()
+    };
+    let names: Vec<_> = repos
+        .iter()
+        .map(|r| (r.name.as_str(), r.remote.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("a", a.to_str().unwrap()),
+            ("work/b", b.to_str().unwrap()),
+            ("work/gh", "https://github.com/x/dup"),
+            ("tool", "https://github.com/x/tool"),
+        ]
+    );
+
+    let resolve = |base: Option<&str>, here: Option<Here>| {
+        d.call(Call::Resolve {
+            repos: vec!["a".into(), "b".into()],
+            base: base.map(String::from),
+            here,
+        })
+    };
+    let Reply::Resolved { repos, warnings } = resolve(None, None) else {
+        panic!()
+    };
+    assert_eq!(
+        repos.iter().map(|r| r.branch.as_str()).collect::<Vec<_>>(),
+        ["main", "dev"]
+    );
+    assert_eq!(repos[1].name, "work/b");
+    assert!(warnings.is_empty());
+
+    let here = Here {
+        remote: a.to_str().unwrap().into(),
+        branch: "feat".into(),
+    };
+    let Reply::Resolved { repos, .. } = resolve(None, Some(here)) else {
+        panic!()
+    };
+    assert_eq!(repos[0].branch, "feat");
+
+    let Reply::Error { message, .. } = resolve(Some("zzz"), None) else {
+        panic!()
+    };
+    assert!(message.contains("zzz"), "{message}");
+    let Reply::Error { message, .. } = d.call(Call::Resolve {
+        repos: vec!["nope".into()],
+        base: None,
+        here: None,
+    }) else {
+        panic!()
+    };
+    assert!(message.contains("no repo 'nope'"), "{message}");
+}
+
+#[test]
+fn socket_and_state_on_start() {
+    let env = Env::new();
+    let socket = env.base.join("run/stew.sock");
+
+    // a stale socket file from a dead daemon is replaced
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    drop(UnixListener::bind(&socket).unwrap());
+    assert!(socket.exists());
+
+    // a creation left running by the last daemon is marked failed
+    let state = env.write(
+        ".local/state/stew/state.json",
+        r#"{"stews":{"a-0000":{"site":"desktop","token":"t"}},
+            "creations":{"b-0000":{"state":"running","started":5},"c-0000":{"state":"failed","started":1,"error":"x"}}}"#,
+    );
+    let d = env.daemon();
+    let v: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(v["creations"]["b-0000"]["state"], "failed");
+    assert!(
+        v["creations"]["b-0000"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("restarted")
+    );
+    assert_eq!(v["creations"]["c-0000"]["error"], "x");
+    assert_eq!(v["stews"]["a-0000"]["site"], "desktop");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&d.socket).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // a live one is not taken over
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stew"));
+    cmd.args(["daemon", "--socket", socket.to_str().unwrap()]);
+    env.envs(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already listens"));
+    assert_eq!(
+        d.call(Call::Hello),
+        Reply::Hello {
+            version: stew_proto::VERSION
+        }
+    );
+
+    // a corrupt state file stops the daemon instead of being overwritten
+    drop(d);
+    fs::write(&state, "{").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stew"));
+    cmd.args(["daemon", "--socket", socket.to_str().unwrap()]);
+    env.envs(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&state).unwrap(), "{");
+}
