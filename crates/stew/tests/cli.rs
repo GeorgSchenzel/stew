@@ -86,7 +86,7 @@ impl Stew for Env {
         let url = remote.to_str().unwrap().to_string();
         self.write(
             ".config/stew/config.yaml",
-            &format!("artifacts: {url}\nscan: false\n"),
+            &format!("artifacts: {url}\nscan: false\nruntime: none\n"),
         );
         url
     }

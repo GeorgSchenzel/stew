@@ -15,21 +15,30 @@ pub struct Host {
     dir: PathBuf,
     /// `STEW_HUB` for processes in its stews.
     hub: String,
+    /// The dir holding the in-box client (as `stew`), first on its stews' `PATH`.
+    client: Option<PathBuf>,
+}
+
+/// The hc session of a host stew's own core. A stew owns a whole machine elsewhere (a box);
+/// on the host it gets a session of its own, so the hub's core (`HC_SESSION=stew`) can add
+/// it as a machine like a box, and its agents' `hc` reaches its own core.
+pub fn hc_session(id: &str) -> String {
+    format!("stew-{id}")
 }
 
 impl Host {
-    pub fn new(dir: PathBuf, hub: String) -> Self {
-        Host { dir, hub }
+    pub fn new(dir: PathBuf, hub: String, client: Option<PathBuf>) -> Self {
+        Host { dir, hub, client }
     }
 
-    fn root(&self, t: &Target) -> Result<PathBuf> {
+    fn root_dir(&self, t: &Target) -> Result<PathBuf> {
         id::check(&t.id)?;
         Ok(self.dir.join(&t.id))
     }
 
     /// The root, which must be a real dir (not a symlink).
     fn existing_root(&self, t: &Target) -> Result<Option<PathBuf>> {
-        let root = self.root(t)?;
+        let root = self.root_dir(t)?;
         match fs::symlink_metadata(&root) {
             Ok(m) if m.is_dir() => Ok(Some(root)),
             Ok(_) => Err(fail!("{} is not a dir", root.display())),
@@ -41,7 +50,15 @@ impl Host {
     fn env(&self, t: &Target) -> Vec<(String, String)> {
         let mut env = t.env.clone();
         env.push(("STEW_HUB".into(), format!("unix:{}", self.hub)));
+        env.push(("HC_SESSION".into(), hc_session(&t.id)));
         env
+    }
+
+    fn path(&self) -> Vec<String> {
+        self.client
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect()
     }
 
     fn guest(&self, t: &Target, guest: &str) -> Result<PathBuf> {
@@ -72,6 +89,7 @@ fn cp(from: &Path, to: &Path) -> Result<()> {
         ],
         cwd: None,
         env: vec![],
+        path: vec![],
     };
     let (code, _, err) = run(&launch, None, None)?;
     if code != 0 {
@@ -86,7 +104,7 @@ impl Driver for Host {
     }
 
     fn create(&self, t: &Target) -> Result<String> {
-        let root = self.root(t)?;
+        let root = self.root_dir(t)?;
         fs::create_dir_all(&self.dir).map_err(|e| fail!("{}: {e}", self.dir.display()))?;
         fs::create_dir(&root).map_err(|e| fail!("cannot create {}: {e}", root.display()))?;
         Ok(root.to_string_lossy().into_owned())
@@ -100,7 +118,7 @@ impl Driver for Host {
     }
 
     fn stop(&self, t: &Target) -> Result<Vec<String>> {
-        let root = self.root(t)?;
+        let root = self.root_dir(t)?;
         Ok(vec![format!(
             "the host driver stops nothing: processes in {} keep running",
             root.display()
@@ -133,6 +151,7 @@ impl Driver for Host {
             argv: argv.to_vec(),
             cwd: Some(root),
             env: self.env(t),
+            path: self.path(),
         })
     }
 
@@ -178,6 +197,10 @@ impl Driver for Host {
         Ok(vec![])
     }
 
+    fn root(&self, t: &Target) -> Result<String> {
+        Ok(self.root_dir(t)?.to_string_lossy().into_owned())
+    }
+
     fn local_remotes(&self) -> LocalRemotes {
         LocalRemotes::OutsideRoot
     }
@@ -197,7 +220,11 @@ mod tests {
     #[test]
     fn lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let h = Host::new(tmp.path().join("stews"), "/run/hub.sock".into());
+        let h = Host::new(
+            tmp.path().join("stews"),
+            "/run/hub.sock".into(),
+            Some(tmp.path().join("client")),
+        );
         let t = target("a-k3fq");
         assert_eq!(h.state(&t).unwrap(), BoxState::Missing);
         assert_eq!(
@@ -215,14 +242,20 @@ mod tests {
         let out = h
             .exec(
                 &t,
-                &sh("pwd; echo $STEW_TOKEN $STEW_HUB; cat"),
+                &sh("pwd; echo $STEW_TOKEN $STEW_HUB $HC_SESSION; echo \"${PATH%%:*}\"; cat"),
                 Some(b"in"),
                 true,
                 None,
             )
             .unwrap();
         assert!(out.ok());
-        assert_eq!(out.stdout(), format!("{root}\ntok unix:/run/hub.sock\nin"));
+        assert_eq!(
+            out.stdout(),
+            format!(
+                "{root}\ntok unix:/run/hub.sock stew-a-k3fq\n{}\nin",
+                tmp.path().join("client").display()
+            )
+        );
 
         fs::write(tmp.path().join("f"), "x").unwrap();
         h.cp_in(&t, &tmp.path().join("f"), "g").unwrap();
@@ -241,7 +274,7 @@ mod tests {
     #[test]
     fn refuses_bad_ids_and_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
-        let h = Host::new(tmp.path().to_path_buf(), "/s".into());
+        let h = Host::new(tmp.path().to_path_buf(), "/s".into(), None);
         assert!(h.create(&target("../x")).is_err());
         assert!(h.create(&target("a/b")).is_err());
         // a root that is a symlink is never followed by remove

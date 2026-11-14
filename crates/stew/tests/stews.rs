@@ -67,7 +67,7 @@ fn config(notes: &Path, stews: &Path, driver: &str) -> String {
         format!("{{driver: host, root: {}}}", stews.display())
     };
     format!(
-        "artifacts: {}\nscan: false\nsite: t\nsites:\n  t: {t}\n  t2: {{driver: host, root: {}2}}\n",
+        "artifacts: {}\nscan: false\nruntime: none\nsite: t\nsites:\n  t: {t}\n  t2: {{driver: host, root: {}2}}\n",
         notes.display(),
         stews.display()
     )

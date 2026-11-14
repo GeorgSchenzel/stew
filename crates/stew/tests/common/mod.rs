@@ -31,6 +31,15 @@ impl Env {
         }
     }
 
+    /// A runtime dir of the test's own (short: socket paths).
+    pub fn runtime(&self) -> PathBuf {
+        let d = self.base.join("xrun");
+        fs::create_dir_all(&d).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        d
+    }
+
     pub fn paths(&self) -> Paths {
         Paths::under(&self.home)
     }
@@ -41,11 +50,19 @@ impl Env {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_DATA_HOME",
-            "XDG_RUNTIME_DIR",
             "STEW_SOCKET",
+            "STEW_HUB",
+            "STEW_TOKEN",
+            "STEW_CLIENT_DIR",
+            "HC_SESSION",
+            "HC_SOCKET",
+            "HC_TERMINAL_ID",
+            "HC_TERMINAL_SOCKET",
         ] {
             cmd.env_remove(var);
         }
+        // never the user's runtime dir: hc there would start cores as systemd user units
+        cmd.env("XDG_RUNTIME_DIR", self.runtime());
         cmd.env("GIT_CONFIG_GLOBAL", self.base.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", &self.home);

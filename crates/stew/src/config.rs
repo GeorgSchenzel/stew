@@ -21,8 +21,12 @@ pub struct Config {
     /// Clones whose `origin` joins the catalog: a dir, or `false`. Default
     /// `~/projects/repos` when it exists.
     pub scan: Option<Scan>,
+    /// The agent `--start` and `agent` use when none is given (default `claude`).
     pub agent: Option<String>,
+    /// The model for that agent (passed through as `--model`).
     pub model: Option<String>,
+    /// The agent runtime: `hc` (default) or `none` (no machines, no agents).
+    pub runtime: Option<RuntimeKind>,
     /// Where stews live, by name. None: `desktop` (bento) and `desktop-host` (host).
     pub sites: Option<BTreeMap<String, Site>>,
 }
@@ -45,6 +49,13 @@ pub struct Site {
 pub enum DriverKind {
     Bento,
     Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    Hc,
+    None,
 }
 
 /// The site `new` uses when none is given and the config names none.
@@ -145,6 +156,9 @@ mod tests {
         );
         assert!(c.site(Some("desktop")).is_err());
         assert!(serde_yaml::from_str::<Config>("sites: {a: {driver: nono}}").is_err());
+        let c: Config = serde_yaml::from_str("runtime: none\n").unwrap();
+        assert_eq!(c.runtime, Some(RuntimeKind::None));
+        assert!(serde_yaml::from_str::<Config>("runtime: rex\n").is_err());
         assert!(serde_yaml::from_str::<Config>("sites: {a: {driver: host, rot: /x}}").is_err());
         let c: Config = serde_yaml::from_str("scan: ~/src\n").unwrap();
         let p = Paths::under(std::path::Path::new("/h"));

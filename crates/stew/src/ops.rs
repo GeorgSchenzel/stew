@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use stew_proto::{
-    CreationInfo, Here, Live, LiveRepo, Openness, Reply, RepoRecord, Resolved, StewMeta, Tracked,
+    AgentInfo, CreationInfo, Here, Live, LiveRepo, Openness, Reply, RepoRecord, Resolved, StewMeta,
+    Tracked,
 };
 
 use crate::catalog::Catalog;
@@ -18,11 +19,15 @@ use crate::error::{Error, Result, fail};
 use crate::git::git;
 use crate::inspect::{self, Look, Looked, Mode};
 use crate::mirror::{meta_yaml, parse_meta};
+use crate::runtime::{self, Runtime};
 use crate::state::{Creation, Placed, Progress};
-use crate::{id, readme, refs};
+use crate::{agent, id, readme, refs};
 
 /// How long `ls` waits for one stew before showing it unreachable.
 const LS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long stopping a stew's own runtime core may take at `remove`.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Marks a stew busy for one command; another command on it at once is refused.
 struct Busy<'a> {
@@ -57,6 +62,10 @@ pub struct NewArgs {
     pub base: Option<String>,
     pub here: Option<Here>,
     pub from: Option<String>,
+    pub brief: Option<String>,
+    pub start: bool,
+    pub agent: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Hub {
@@ -73,7 +82,10 @@ impl Hub {
     fn driver(&self, config: &Config, site: Option<&str>) -> Result<(String, Box<dyn Driver>)> {
         let (name, site) = config.site(site)?;
         let hub = self.socket.to_string_lossy();
-        Ok((name, driver::for_site(&site, &self.paths, &hub)))
+        Ok((
+            name,
+            driver::for_site(&site, &self.paths, &hub, self.client.as_deref()),
+        ))
     }
 
     /// A stew that exists on a site: its record and its site's driver.
@@ -124,6 +136,32 @@ impl Hub {
         if let Some(f) = &a.from {
             id::check(f)?;
         }
+        if a.start && a.brief.is_none() {
+            return Err(fail!("--start needs --brief"));
+        }
+        if (a.agent.is_some() || a.model.is_some()) && !a.start {
+            return Err(fail!("--agent and --model go with --start"));
+        }
+        if a.brief
+            .as_ref()
+            .is_some_and(|b| b.len() > stew_proto::MAX_BRIEF)
+        {
+            return Err(fail!(
+                "the brief is longer than {} bytes",
+                stew_proto::MAX_BRIEF
+            ));
+        }
+        // the agent's command line, checked before anything exists
+        let launch = if a.start {
+            let (agent, model) = agent::choose(&config, a.agent.as_deref(), a.model.as_deref());
+            Some((
+                agent.clone(),
+                agent::command(&agent, model.as_deref(), agent::BRIEF_TASK)?,
+            ))
+        } else {
+            None
+        };
+        let rt = runtime::for_config(&config);
         let artifacts = self.artifacts(&config)?;
         let (site, driver) = self.driver(&config, a.site.as_deref())?;
         let feature = match a.branch.as_deref() {
@@ -156,7 +194,7 @@ impl Hub {
         let id = {
             let mirror = self.mirror(&config)?;
             let _lock = self.mirror_lock();
-            mirror.claim(&meta, None)?
+            mirror.claim(&meta, a.brief.as_deref())?
         };
         let token = id::token()?;
         self.create(
@@ -164,13 +202,29 @@ impl Hub {
             &token,
             &site,
             driver.as_ref(),
+            rt.as_ref(),
             &artifacts,
             &resolved,
             feature.as_deref(),
             &mut warnings,
             None,
         )?;
-        Ok(Reply::Created { id, warnings })
+        let agent = match launch {
+            None => None,
+            Some((name, argv)) => {
+                let t = target(&id, &token);
+                let address = driver
+                    .root(&t)
+                    .and_then(|root| rt.run(&id, &name, &argv, &root))
+                    .map_err(|e| fail!("stew {id} exists, but its agent did not start: {e}"))?;
+                Some(address)
+            }
+        };
+        Ok(Reply::Created {
+            id,
+            agent,
+            warnings,
+        })
     }
 
     pub fn open_stew(&self, id: &str, site: Option<&str>) -> Result<Reply> {
@@ -203,11 +257,13 @@ impl Hub {
             ..meta.clone()
         });
         let token = id::token()?;
+        let rt = runtime::for_config(&config);
         self.create(
             id,
             &token,
             &site,
             driver.as_ref(),
+            rt.as_ref(),
             &artifacts,
             &resolved,
             None,
@@ -216,12 +272,15 @@ impl Hub {
         )?;
         Ok(Reply::Created {
             id: id.to_string(),
+            agent: None,
             warnings,
         })
     }
 
     /// The driver's create, clones through `exec`, (reopen: the commit), the driver's
-    /// start. A failure removes the stew from the site and records the creation as failed.
+    /// start, the runtime's connect. A failure up to the start removes the stew from the
+    /// site and records the creation as failed; one to connect is a warning (`stew start`
+    /// connects again).
     #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
@@ -229,6 +288,7 @@ impl Hub {
         token: &str,
         site: &str,
         driver: &dyn Driver,
+        rt: &dyn Runtime,
         artifacts: &str,
         resolved: &[Resolved],
         feature: Option<&str>,
@@ -300,7 +360,9 @@ impl Hub {
                             token: token.to_string(),
                         },
                     );
-                })
+                })?;
+                connect(rt, id, warnings);
+                Ok(())
             }
             Err(e) => {
                 let mut msg = e.to_string();
@@ -334,6 +396,7 @@ impl Hub {
         let _busy = self.busy(id)?;
         let t = target(id, &placed.token);
         let mut warnings = Vec::new();
+        let rt = runtime::for_config(&config);
 
         let look = match inspect::look(driver.as_ref(), &t, Mode::Check, false, None) {
             Ok(Looked::Look(l)) => Some(l),
@@ -390,7 +453,7 @@ impl Hub {
             None => {}
         }
         // B3: export the stew's sessions to the transcripts repo here
-        // B4: disconnect it from the agent runtime here
+        disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings);
         driver.remove(&t)?;
         self.save_state(|s| {
             s.stews.remove(id);
@@ -472,8 +535,9 @@ impl Hub {
             let res = (|| {
                 let (placed, driver) = self.placed(&config, i)?;
                 let _busy = self.busy(i)?;
-                // B4: (re)connect it to the agent runtime here
-                driver.start(&target(i, &placed.token))
+                let mut w = driver.start(&target(i, &placed.token))?;
+                connect(runtime::for_config(&config).as_ref(), i, &mut w);
+                Ok(w)
             })();
             match res {
                 Ok(w) => warnings.extend(w),
@@ -561,11 +625,7 @@ impl Hub {
                 },
             )?
         };
-        Ok(Reply::Launch {
-            argv: l.argv,
-            cwd: l.cwd.map(|c| c.to_string_lossy().into_owned()),
-            env: l.env,
-        })
+        Ok(launch_reply(l))
     }
 
     pub fn ls(&self) -> Result<Reply> {
@@ -575,6 +635,7 @@ impl Hub {
             (f.state.stews.clone(), f.state.creations.clone())
         };
         let mut warnings = Vec::new();
+        let agents = self.agents(&config, &mut warnings);
         let tracked: BTreeMap<String, Tracked> = match self.mirror_every(&config, &mut warnings) {
             Ok(all) => all.into_iter().map(|t| (t.meta.id.clone(), t)).collect(),
             Err(e) => {
@@ -588,7 +649,8 @@ impl Hub {
                 .map(|(id, p)| {
                     let config = &config;
                     let tracked = tracked.get(id);
-                    s.spawn(move || self.live(config, id, p, tracked))
+                    let agents = agents.get(id).cloned().unwrap_or_default();
+                    s.spawn(move || self.live(config, id, p, tracked, agents))
                 })
                 .collect();
             jobs.into_iter().filter_map(|j| j.join().ok()).collect()
@@ -613,29 +675,29 @@ impl Hub {
         })
     }
 
+    /// The runtime's agents by stew; a runtime that can't be asked is a warning.
+    fn agents(
+        &self,
+        config: &Config,
+        warnings: &mut Vec<String>,
+    ) -> BTreeMap<String, Vec<AgentInfo>> {
+        runtime::for_config(config).agents().unwrap_or_else(|e| {
+            warnings.push(format!("agents unknown: {e}"));
+            BTreeMap::new()
+        })
+    }
+
     /// One stew for `ls`: live when it runs (never starting it), else its notes branch.
-    fn live(&self, config: &Config, id: &str, p: &Placed, tracked: Option<&Tracked>) -> Live {
-        let mut live = Live {
-            id: id.to_string(),
-            title: tracked.map(|t| t.meta.title.clone()).unwrap_or_default(),
-            from: tracked.and_then(|t| t.meta.from.clone()),
-            site: p.site.clone(),
-            state: "unreachable".into(),
-            repos: tracked
-                .map(|t| {
-                    t.meta
-                        .repos
-                        .iter()
-                        .map(|r| LiveRepo {
-                            dir: r.name.rsplit('/').next().unwrap_or(&r.name).to_string(),
-                            branch: r.branch.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            now: tracked.map(|t| t.now.clone()).unwrap_or_default(),
-            updated: tracked.map_or(0, |t| t.updated),
-        };
+    fn live(
+        &self,
+        config: &Config,
+        id: &str,
+        p: &Placed,
+        tracked: Option<&Tracked>,
+        agents: Vec<AgentInfo>,
+    ) -> Live {
+        let mut live = from_tracked(id, tracked, &p.site, "unreachable");
+        live.agents = agents;
         let Ok((_, driver)) = self.driver(config, Some(&p.site)) else {
             return live;
         };
@@ -670,6 +732,230 @@ impl Hub {
             Err(_) => live.state = "unreachable".into(),
         }
         live
+    }
+}
+
+impl Hub {
+    /// The caller's own stew, live.
+    pub fn info(&self, id: &str) -> Result<Reply> {
+        let config = Config::load(&self.paths)?;
+        let (placed, driver) = self.placed(&config, id)?;
+        let mut warnings = Vec::new();
+        let agents = self.agents(&config, &mut warnings);
+        let tracked = self
+            .mirror_every(&config, &mut warnings)
+            .ok()
+            .and_then(|all| all.into_iter().find(|t| t.meta.id == id));
+        let stew = self.live(
+            &config,
+            id,
+            &placed,
+            tracked.as_ref(),
+            agents.get(id).cloned().unwrap_or_default(),
+        );
+        let root = driver.root(&target(id, &placed.token))?;
+        Ok(Reply::Info {
+            stew,
+            driver: placed_driver_word(&config, &placed.site),
+            root,
+        })
+    }
+
+    /// An agent in `id` on `task`. A stew's client may start one only in a stew it started
+    /// (or in itself). Actions start stews: a stopped one is started, and connected.
+    pub fn agent(
+        &self,
+        id: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        task: &str,
+        caller: Option<&str>,
+    ) -> Result<Reply> {
+        let config = Config::load(&self.paths)?;
+        let (agent, model) = agent::choose(&config, agent, model);
+        let argv = agent::command(&agent, model.as_deref(), task)?;
+        let (placed, driver) = self.placed(&config, id)?;
+        let mut warnings = Vec::new();
+        if let Some(c) = caller.filter(|c| *c != id) {
+            let from = self
+                .mirror_every(&config, &mut warnings)?
+                .into_iter()
+                .find(|t| t.meta.id == id)
+                .and_then(|t| t.meta.from);
+            if from.as_deref() != Some(c) {
+                return Err(Error::Refused(format!(
+                    "{id} was not started from {c}: agents go only into stews you started"
+                )));
+            }
+        }
+        let _busy = self.busy(id)?;
+        let t = target(id, &placed.token);
+        warnings.extend(driver.start(&t)?);
+        let rt = runtime::for_config(&config);
+        rt.connect(id, &runtime::via(id))?;
+        let address = rt.run(id, &agent, &argv, &driver.root(&t)?)?;
+        Ok(Reply::Started { address, warnings })
+    }
+
+    /// Where `stew attach` runs: an agent's address (`<id>/<name>`), or a name that only
+    /// one stew's agents have.
+    pub fn attach(&self, agent: &str) -> Result<Reply> {
+        let config = Config::load(&self.paths)?;
+        let ids: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state
+            .stews
+            .keys()
+            .cloned()
+            .collect();
+        let rt = runtime::for_config(&config);
+        let all = rt.agents()?;
+        let found: Vec<&AgentInfo> = ids
+            .iter()
+            .flat_map(|i| all.get(i).into_iter().flatten())
+            .filter(|a| {
+                a.address == agent
+                    || (!agent.contains('/')
+                        && a.address.rsplit_once('/').map(|(_, n)| n) == Some(agent))
+            })
+            .collect();
+        match found.as_slice() {
+            [one] => Ok(launch_reply(rt.attach(&one.address)?)),
+            [] => Err(fail!("no agent {agent} in a stew (`stew ls` lists them)")),
+            many => Err(fail!(
+                "{agent} is in several stews: {}",
+                many.iter()
+                    .map(|a| a.address.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The tracked stews started from `id`, open and closed, live where they exist.
+    pub fn ls_from(&self, id: &str) -> Result<Reply> {
+        id::check(id)?;
+        let config = Config::load(&self.paths)?;
+        let mut warnings = Vec::new();
+        let agents = self.agents(&config, &mut warnings);
+        let placed = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state
+            .stews
+            .clone();
+        let mut children: Vec<Tracked> = self
+            .mirror_every(&config, &mut warnings)?
+            .into_iter()
+            .filter(|t| t.meta.from.as_deref() == Some(id))
+            .collect();
+        children.sort_by_key(|t| std::cmp::Reverse(t.updated));
+        let stews = std::thread::scope(|s| {
+            let jobs: Vec<_> = children
+                .iter()
+                .map(|t| {
+                    let config = &config;
+                    let p = placed.get(&t.meta.id);
+                    let agents = agents.get(&t.meta.id).cloned().unwrap_or_default();
+                    s.spawn(move || match p {
+                        Some(p) => self.live(config, &t.meta.id, p, Some(t), agents),
+                        None => {
+                            let word = if t.meta.is_closed() {
+                                "closed"
+                            } else {
+                                "removed"
+                            };
+                            from_tracked(&t.meta.id, Some(t), "", word)
+                        }
+                    })
+                })
+                .collect();
+            jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+        });
+        Ok(Reply::Live {
+            stews,
+            creations: vec![],
+            warnings,
+        })
+    }
+}
+
+/// A stew as its notes branch has it (the state a word for where it is).
+fn from_tracked(id: &str, tracked: Option<&Tracked>, site: &str, state: &str) -> Live {
+    Live {
+        id: id.to_string(),
+        title: tracked.map(|t| t.meta.title.clone()).unwrap_or_default(),
+        from: tracked.and_then(|t| t.meta.from.clone()),
+        site: site.to_string(),
+        state: state.into(),
+        repos: tracked
+            .map(|t| {
+                t.meta
+                    .repos
+                    .iter()
+                    .map(|r| LiveRepo {
+                        dir: r.name.rsplit('/').next().unwrap_or(&r.name).to_string(),
+                        branch: r.branch.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        now: tracked.map(|t| t.now.clone()).unwrap_or_default(),
+        updated: tracked.map_or(0, |t| t.updated),
+        agents: vec![],
+    }
+}
+
+fn placed_driver_word(config: &Config, site: &str) -> String {
+    match config.site(Some(site)) {
+        Ok((_, s)) => match s.driver {
+            crate::config::DriverKind::Bento => "bento".into(),
+            crate::config::DriverKind::Host => "host".into(),
+        },
+        Err(_) => "unknown".into(),
+    }
+}
+
+fn launch_reply(l: driver::Launch) -> Reply {
+    Reply::Launch {
+        argv: l.argv,
+        cwd: l.cwd.map(|c| c.to_string_lossy().into_owned()),
+        env: l.env,
+        path: l.path,
+    }
+}
+
+/// Connects a stew to the runtime; a failure is a warning (`stew start` connects again).
+fn connect(rt: &dyn Runtime, id: &str, warnings: &mut Vec<String>) {
+    if let Err(e) = rt.connect(id, &runtime::via(id)) {
+        warnings.push(format!(
+            "{id} is not connected to the agent runtime: {e} (`stew start {id}` tries again)"
+        ));
+    }
+}
+
+/// Before a stew goes: forget its machine, then stop its own core where it lives (on the
+/// host it would outlive the dir, its agents with it). In that order: a machine still
+/// there would start the core again through its via. Failures are warnings.
+fn disconnect(rt: &dyn Runtime, driver: &dyn Driver, t: &Target, warnings: &mut Vec<String>) {
+    if let Err(e) = rt.disconnect(&t.id) {
+        warnings.push(format!("disconnecting {} from the runtime: {e}", t.id));
+    }
+    if let Some(argv) = rt.stop_there() {
+        match driver.exec(t, &argv, None, true, Some(STOP_TIMEOUT)) {
+            Ok(out) if out.ok() => {}
+            // stopped or gone: nothing of it runs
+            Ok(out) if !matches!(out.status, driver::Status::Exited(_)) => {}
+            Ok(out) => warnings.push(format!(
+                "stopping {}'s runtime core: {}",
+                t.id,
+                out.reason()
+            )),
+            Err(e) => warnings.push(format!("stopping {}'s runtime core: {e}", t.id)),
+        }
     }
 }
 

@@ -89,11 +89,20 @@ impl StateFile {
     pub fn save(&self) -> Result<()> {
         let dir = self.path.parent().ok_or_else(|| fail!("bad state path"))?;
         fs::create_dir_all(dir)?;
+        // it holds the stews' tokens: owner only
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         let tmp = self.path.with_extension("json.tmp");
         let mut text = serde_json::to_vec_pretty(&self.state).expect("State serializes");
         text.push(b'\n');
         let write = || -> std::io::Result<()> {
-            let mut f = File::create(&tmp)?;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
             f.write_all(&text)?;
             f.sync_all()?;
             fs::rename(&tmp, &self.path)?;
@@ -133,6 +142,11 @@ mod tests {
         assert!(f.in_progress());
         f.save().unwrap();
         assert!(!path.with_extension("json.tmp").exists());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let mut g = StateFile::load(&path).unwrap();
         assert_eq!(g.state, f.state);

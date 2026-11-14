@@ -81,6 +81,11 @@ impl Paths {
         self.data.join("artifacts.git")
     }
 
+    /// The skills dir boxes see (bento's global config mounts it read-only).
+    pub fn skills(&self) -> PathBuf {
+        self.data.join("skills")
+    }
+
     /// `~/x` → `$HOME/x`; anything else as given.
     pub fn expand(&self, p: &str) -> PathBuf {
         match p.strip_prefix("~/") {

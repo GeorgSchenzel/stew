@@ -11,15 +11,28 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod show;
+
+/// The `stew` skill (what exists, for agents in a stew); ships with stew.
+pub const SKILL: &str = include_str!("../../../skills/stew/SKILL.md");
+
 /// Bumped when a request or reply changes incompatibly.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// The longest request line the daemon reads (a brief travels inside one).
+pub const MAX_REQUEST: u64 = 4 << 20;
+
+/// The longest brief `new` takes.
+pub const MAX_BRIEF: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
-    /// The caller's stew, sent by the in-box client (found from `notes/stew.yaml`).
+    /// The caller's stew, sent by the in-box client (found from `notes/stew.yaml`). A request
+    /// that names one is taken as coming from that stew only with its token, and only for
+    /// the calls a stew's client makes (`Call::from_stew`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stew: Option<String>,
-    /// The box's token (the secret `stew-token`). Not checked yet (hardening).
+    /// The stew's token (`STEW_TOKEN`), issued by the daemon at `new`/`open`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(flatten)]
@@ -72,8 +85,19 @@ pub enum Call {
         base: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         here: Option<Here>,
+        /// Ignored from a stew's client: the daemon sets it to the caller.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
+        /// `notes/BRIEF.md`, in the claim commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
+        /// An agent starts on the brief once the stew exists.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        start: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// A tracked stew recreated on a site; a closed one is reopened.
     Open {
@@ -115,6 +139,40 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tty: bool,
     },
+    /// The caller's own stew (a stew's client only).
+    Info,
+    /// Starts an agent in a stew on `task`. From a stew's client: only in a stew it started.
+    Agent {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        task: String,
+    },
+    /// Where an agent's live terminal is attached from (the client runs it).
+    Attach { agent: String },
+    /// The stews started from `id` (`.`: the caller's own), live where they exist.
+    LsFrom { id: String },
+    /// Assembles the skills dir boxes see (`~/.local/share/stew/skills/`).
+    Skills,
+}
+
+impl Call {
+    /// The calls a stew's client makes. Anything else that names a stew is refused, so an
+    /// agent's mistake can't `remove` or `exec` into another stew through its client. (Not
+    /// a security boundary: a request that names no stew is the host CLI's.)
+    pub fn from_stew(&self) -> bool {
+        matches!(
+            self,
+            Call::Hello
+                | Call::Repos
+                | Call::Info
+                | Call::New { .. }
+                | Call::Agent { .. }
+                | Call::LsFrom { .. }
+        )
+    }
 }
 
 /// The repo a client runs in, which implies its current branch as that repo's base.
@@ -141,10 +199,25 @@ pub enum Reply {
         stews: Vec<Tracked>,
         warnings: Vec<String>,
     },
-    /// `new` and `open`: the stew exists.
+    /// `new` and `open`: the stew exists (with `--start`, its agent runs at `agent`).
     Created {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
         warnings: Vec<String>,
+    },
+    /// `agent`: it runs, at this address (`<id>/<name>`).
+    Started {
+        address: String,
+        warnings: Vec<String>,
+    },
+    /// The caller's stew.
+    Info {
+        stew: Live,
+        /// The site's driver (`bento`, `host`).
+        driver: String,
+        /// Where its root is on its site.
+        root: String,
     },
     /// A command that has nothing else to say.
     Done {
@@ -156,13 +229,16 @@ pub enum Reply {
         creations: Vec<CreationInfo>,
         warnings: Vec<String>,
     },
-    /// Run this (for `exec`/`enter`): argv, in `cwd` when set, with `env` added.
+    /// Run this (for `exec`/`enter`/`attach`): argv, in `cwd` when set, with `env` added
+    /// and `path` put before the client's own `PATH`.
     Launch {
         argv: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
     },
     Error {
         kind: ErrorKind,
@@ -186,6 +262,21 @@ pub struct Live {
     pub now: Vec<String>,
     /// Unix time of the last commit on its notes branch (0: unknown).
     pub updated: i64,
+    /// Its agents in the runtime, while it runs.
+    #[serde(default)]
+    pub agents: Vec<AgentInfo>,
+}
+
+/// An agent (a live terminal of the runtime) in a stew.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    /// `<id>/<name>`, or `<id>/t<n>` for a terminal without a name.
+    pub address: String,
+    /// The program, as the runtime sees it (`claude`, `opencode`, `sh`).
+    pub program: String,
+    /// Its own word for what it does (OSC 7501: `working`, `idle`, `blocked`, …), else
+    /// `running`.
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -316,6 +407,16 @@ pub fn recv<T: DeserializeOwned>(r: &mut impl BufRead) -> io::Result<Option<T>> 
         ));
     }
     Ok(Some(serde_json::from_str(&line)?))
+}
+
+/// `STEW_HUB` as a socket path: `unix:<path>` (the only form so far).
+pub fn hub_socket(hub: &str) -> Result<std::path::PathBuf, String> {
+    match hub.strip_prefix("unix:") {
+        Some(p) if p.starts_with('/') => Ok(p.into()),
+        _ => Err(format!(
+            "STEW_HUB '{hub}' is not unix:<absolute socket path>"
+        )),
+    }
 }
 
 /// Sends `req` to the daemon at `socket` and returns its reply.

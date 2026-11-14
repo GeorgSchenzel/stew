@@ -84,6 +84,7 @@ impl Bento {
             argv: self.argv(args),
             cwd: None,
             env: vec![],
+            path: vec![],
         };
         let (code, out, err) = run(&launch, None, timeout)?;
         Ok((
@@ -232,6 +233,7 @@ impl Driver for Bento {
             argv: self.argv(&args),
             cwd: None,
             env: vec![],
+            path: vec![],
         })
     }
 
@@ -241,6 +243,7 @@ impl Driver for Bento {
             argv: self.argv(&["enter", &t.id]),
             cwd: None,
             env: vec![],
+            path: vec![],
         })
     }
 
@@ -295,6 +298,11 @@ impl Driver for Bento {
     fn ports(&self, t: &Target) -> Result<Vec<Port>> {
         let (out, _) = self.ok(&["ports", &t.id, "--json"], "bento ports", &t.id)?;
         parse_ports(&out)
+    }
+
+    fn root(&self, t: &Target) -> Result<String> {
+        id::check(&t.id)?;
+        Ok("/workspace".into())
     }
 
     fn local_remotes(&self) -> LocalRemotes {

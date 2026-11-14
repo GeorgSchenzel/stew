@@ -16,14 +16,25 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../crates
+      ../skills
     ];
   };
 
   cargoLock.lockFile = ../Cargo.lock;
-  cargoBuildFlags = [
-    "-p"
-    (if box then "stew-box" else "stew")
-  ];
+  # the host package carries the in-box client too: host-driver stews get it first on PATH
+  cargoBuildFlags =
+    if box then
+      [
+        "-p"
+        "stew-box"
+      ]
+    else
+      [
+        "-p"
+        "stew"
+        "-p"
+        "stew-box"
+      ];
 
   # integration tests shell out to git; `just test` runs them
   doCheck = false;
@@ -38,6 +49,8 @@ rustPlatform.buildRustPackage {
       ''
     else
       ''
+        mkdir -p $out/libexec/stew
+        mv $out/bin/stew-box $out/libexec/stew/stew
         wrapProgram $out/bin/stew \
           --suffix PATH : ${lib.makeBinPath [ gitMinimal ]}
       '';

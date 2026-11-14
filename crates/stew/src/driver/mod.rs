@@ -29,6 +29,8 @@ pub struct Launch {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Dirs put before the runner's own `PATH` (host: the in-box client's dir).
+    pub path: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,6 +158,8 @@ pub trait Driver: Send + Sync {
         no_start: bool,
         timeout: Option<Duration>,
     ) -> Result<Output>;
+    /// Its root where it lives (bento: `/workspace`; host: the dir).
+    fn root(&self, t: &Target) -> Result<String>;
     /// Copies a host file or dir into the stew (`guest` relative to the root) or out of it.
     fn cp_in(&self, t: &Target, host: &Path, guest: &str) -> Result<()>;
     fn cp_out(&self, t: &Target, guest: &str, host: &Path) -> Result<()>;
@@ -163,8 +167,9 @@ pub trait Driver: Send + Sync {
     fn local_remotes(&self) -> LocalRemotes;
 }
 
-/// The driver for a site. `hub` is the address the host driver gives its stews in `STEW_HUB`.
-pub fn for_site(site: &Site, paths: &Paths, hub: &str) -> Box<dyn Driver> {
+/// The driver for a site. `hub` is the hub's socket, which the host driver gives its stews
+/// in `STEW_HUB`; `client` the dir of the in-box client, put first on their `PATH`.
+pub fn for_site(site: &Site, paths: &Paths, hub: &str, client: Option<&Path>) -> Box<dyn Driver> {
     match site.driver {
         DriverKind::Bento => Box::new(bento::Bento::new(site.via.as_deref())),
         DriverKind::Host => {
@@ -172,7 +177,11 @@ pub fn for_site(site: &Site, paths: &Paths, hub: &str) -> Box<dyn Driver> {
                 .root
                 .as_deref()
                 .map_or_else(|| paths.home.join("projects/stews"), |r| paths.expand(r));
-            Box::new(host::Host::new(dir, hub.to_string()))
+            Box::new(host::Host::new(
+                dir,
+                hub.to_string(),
+                client.map(Path::to_path_buf),
+            ))
         }
     }
 }
@@ -189,18 +198,46 @@ pub fn run(
         .split_first()
         .ok_or_else(|| fail!("empty command"))?;
     let mut cmd = Command::new(prog);
-    cmd.args(args)
-        .envs(launch.env.iter().map(|(k, v)| (k, v)))
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).envs(launch.env.iter().map(|(k, v)| (k, v)));
+    if let Some(path) = launch.full_path() {
+        cmd.env("PATH", path);
+    }
     if let Some(cwd) = &launch.cwd {
         cmd.current_dir(cwd);
     }
+    run_command(cmd, stdin, timeout)
+}
+
+impl Launch {
+    /// `path` before this process's own `PATH`, when there is any.
+    pub fn full_path(&self) -> Option<std::ffi::OsString> {
+        if self.path.is_empty() {
+            return None;
+        }
+        let own = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = self
+            .path
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::env::split_paths(&own));
+        std::env::join_paths(dirs).ok()
+    }
+}
+
+/// Runs `cmd` as `run` does.
+pub fn run_command(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    let prog = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| fail!("cannot run {prog}: {e}"))?;
     let mut out_pipe = child.stdout.take().expect("piped");
     let mut err_pipe = child.stderr.take().expect("piped");
@@ -283,6 +320,7 @@ mod tests {
             argv: vec!["sh".into(), "-c".into(), "cat; echo err >&2; exit 3".into()],
             cwd: None,
             env: vec![],
+            path: vec![],
         };
         let (code, out, err) = run(&l, Some(b"hi"), None).unwrap();
         assert_eq!((code, &out[..], &err[..]), (3, &b"hi"[..], &b"err\n"[..]));
@@ -290,6 +328,7 @@ mod tests {
             argv: vec!["sleep".into(), "5".into()],
             cwd: None,
             env: vec![],
+            path: vec![],
         };
         let t = Instant::now();
         assert!(run(&slow, None, Some(Duration::from_millis(200))).is_err());
@@ -298,6 +337,7 @@ mod tests {
             argv: vec!["sh".into(), "-c".into(), "kill -9 $$".into()],
             cwd: None,
             env: vec![],
+            path: vec![],
         };
         assert_eq!(run(&kill, None, None).unwrap().0, 137);
     }

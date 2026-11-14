@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use stew::daemon::{self, Hub};
 use stew::error::{Error, Result};
 use stew::paths::Paths;
-use stew_proto::{Call, CreationInfo, Here, Live, Reply, Request, Tracked};
+use stew_proto::show::{age, live_table, now};
+use stew_proto::{Call, Here, Reply, Request, Tracked};
 
 /// Stews: workspaces of repo clones in a box.
 #[derive(Parser)]
@@ -34,7 +35,35 @@ enum Cmd {
         /// The base branch for every repo that has it
         #[arg(long)]
         base: Option<String>,
+        /// A file (`-`: stdin) that becomes its notes/BRIEF.md
+        #[arg(long)]
+        brief: Option<String>,
+        /// Start an agent on the brief
+        #[arg(long, requires = "brief")]
+        start: bool,
+        /// The agent for --start (claude, opencode; default from config.yaml)
+        #[arg(long, requires = "start")]
+        agent: Option<String>,
+        /// Its model, passed through as --model
+        #[arg(long, requires = "start")]
+        model: Option<String>,
     },
+    /// Start an agent in a stew on a task; prints its address
+    Agent {
+        id: String,
+        /// claude, opencode (default from config.yaml)
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        task: String,
+    },
+    /// An agent's live terminal (`<id>/<name>`, or a name only one stew has); ctrl+\ leaves it
+    Attach { agent: String },
+    /// Assemble the skills dir boxes see (~/.local/share/stew/skills)
+    Skills,
+    /// Print the stew skill
+    Skill,
     /// Recreate a tracked stew on a site, on its recorded branches; reopens a closed one
     Open {
         id: String,
@@ -141,8 +170,13 @@ fn run(cli: Cli) -> Result<u8> {
             site,
             branch,
             base,
+            brief,
+            start,
+            agent,
+            model,
         } => {
             let here = if base.is_none() { here() } else { None };
+            let brief = brief.map(|f| read_brief(&f)).transpose()?;
             let reply = call(
                 &paths,
                 Call::New {
@@ -153,9 +187,40 @@ fn run(cli: Cli) -> Result<u8> {
                     base,
                     here,
                     from: None,
+                    brief,
+                    start,
+                    agent,
+                    model,
                 },
             )?;
             created(reply)
+        }
+        Cmd::Agent {
+            id,
+            agent,
+            model,
+            task,
+        } => match call(
+            &paths,
+            Call::Agent {
+                id,
+                agent,
+                model,
+                task,
+            },
+        )? {
+            Reply::Started { address, warnings } => {
+                warn(&warnings);
+                println!("{address}");
+                Ok(0)
+            }
+            _ => Err(Error::Fail("unexpected reply from the daemon".into())),
+        },
+        Cmd::Attach { agent } => launch(&paths, Call::Attach { agent }),
+        Cmd::Skills => done(call(&paths, Call::Skills)?),
+        Cmd::Skill => {
+            print!("{}", stew_proto::SKILL);
+            Ok(0)
         }
         Cmd::Open { id, site } => created(call(&paths, Call::Open { id, site })?),
         Cmd::Remove { id, force } => done(call(&paths, Call::Remove { id, force })?),
@@ -191,34 +256,22 @@ fn run(cli: Cli) -> Result<u8> {
             json,
             ..
         } => {
-            let mut stews = Vec::new();
-            for closed in [false, true] {
-                let Reply::Tracked { stews: s, warnings } = call(
-                    &paths,
-                    Call::LsAll {
-                        search: None,
-                        closed,
-                    },
-                )?
-                else {
-                    return Err(Error::Fail("unexpected reply from the daemon".into()));
-                };
-                if !closed {
-                    warn(&warnings);
-                }
-                stews.extend(
-                    s.into_iter()
-                        .filter(|t| t.meta.from.as_deref() == Some(from.as_str())),
-                );
-            }
-            stews.sort_by_key(|t| std::cmp::Reverse(t.updated));
+            let Reply::Live {
+                stews,
+                creations,
+                warnings,
+            } = call(&paths, Call::LsFrom { id: from })?
+            else {
+                return Err(Error::Fail("unexpected reply from the daemon".into()));
+            };
+            warn(&warnings);
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&stews).expect("serializes")
                 );
             } else {
-                print!("{}", table(&stews));
+                print!("{}", live_table(&stews, &creations));
             }
             Ok(0)
         }
@@ -296,8 +349,15 @@ fn warn(warnings: &[String]) {
 
 fn created(reply: Reply) -> Result<u8> {
     match reply {
-        Reply::Created { id, warnings } => {
+        Reply::Created {
+            id,
+            agent,
+            warnings,
+        } => {
             warn(&warnings);
+            if let Some(a) = agent {
+                eprintln!("stew: agent {a}");
+            }
             println!("{id}");
             Ok(0)
         }
@@ -318,7 +378,13 @@ fn done(reply: Reply) -> Result<u8> {
 /// Asks the daemon where the command runs, then runs it as this process (its exit code
 /// and signals are the command's).
 fn launch(paths: &Paths, call_: Call) -> Result<u8> {
-    let Reply::Launch { argv, cwd, env } = call(paths, call_)? else {
+    let Reply::Launch {
+        argv,
+        cwd,
+        env,
+        path,
+    } = call(paths, call_)?
+    else {
         return Err(Error::Fail("unexpected reply from the daemon".into()));
     };
     let (prog, args) = argv
@@ -326,6 +392,16 @@ fn launch(paths: &Paths, call_: Call) -> Result<u8> {
         .ok_or_else(|| Error::Fail("the daemon gave an empty command".into()))?;
     let mut cmd = Command::new(prog);
     cmd.args(args).envs(env);
+    if !path.is_empty() {
+        let own = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = path
+            .iter()
+            .map(std::path::PathBuf::from)
+            .chain(std::env::split_paths(&own));
+        if let Ok(p) = std::env::join_paths(dirs) {
+            cmd.env("PATH", p);
+        }
+    }
     if let Some(c) = cwd {
         cmd.current_dir(c);
     }
@@ -363,60 +439,28 @@ fn here() -> Option<Here> {
     })
 }
 
-/// Per stew: id, title, site, state, age; then from, repos and Now lines indented.
-fn live_table(stews: &[Live], creations: &[CreationInfo]) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let w0 = stews.iter().map(|t| t.id.len()).max().unwrap_or(0);
-    let w1 = stews
-        .iter()
-        .map(|t| t.title.chars().count())
-        .max()
-        .unwrap_or(0);
-    let w2 = stews.iter().map(|t| t.site.len()).max().unwrap_or(0);
-    let mut out = String::new();
-    for t in stews {
-        let age = if t.updated > 0 {
-            age(now - t.updated)
-        } else {
-            "?".into()
-        };
-        let head = format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<11}  {:>4}",
-            t.id, t.title, t.site, t.state, age
-        );
-        out.push_str(head.trim_end());
-        out.push('\n');
-        if let Some(f) = &t.from {
-            out.push_str(&format!("    from {f}\n"));
-        }
-        if !t.repos.is_empty() {
-            let repos: Vec<String> = t
-                .repos
-                .iter()
-                .map(|r| {
-                    if r.branch.is_empty() {
-                        format!("{} (detached)", r.dir)
-                    } else {
-                        format!("{}@{}", r.dir, r.branch)
-                    }
-                })
-                .collect();
-            out.push_str(&format!("    {}\n", repos.join("  ")));
-        }
-        for line in &t.now {
-            out.push_str(&format!("    - {line}\n"));
-        }
+/// A brief from a file, or stdin for `-`.
+fn read_brief(file: &str) -> Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    let res = if file == "-" {
+        std::io::stdin()
+            .take(stew_proto::MAX_BRIEF as u64 + 1)
+            .read_to_string(&mut text)
+    } else {
+        std::fs::File::open(file).and_then(|f| {
+            f.take(stew_proto::MAX_BRIEF as u64 + 1)
+                .read_to_string(&mut text)
+        })
+    };
+    res.map_err(|e| Error::Fail(format!("cannot read the brief {file}: {e}")))?;
+    if text.len() > stew_proto::MAX_BRIEF {
+        return Err(Error::Fail(format!(
+            "the brief is longer than {} bytes",
+            stew_proto::MAX_BRIEF
+        )));
     }
-    for c in creations {
-        let what = match &c.error {
-            Some(e) => format!("creation {}: {e}", c.state),
-            None => format!("creation {}", c.state),
-        };
-        out.push_str(&format!("{}  {what}\n", c.id));
-    }
-    out
+    Ok(text)
 }
 
 /// One request to the daemon; its error replies become errors.
@@ -436,9 +480,7 @@ fn call(paths: &Paths, call: Call) -> Result<Reply> {
 
 /// Per stew: id, title, age (and `closed`), then its description and Now lines indented.
 fn table(stews: &[Tracked]) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+    let now = now();
     let w0 = stews.iter().map(|t| t.meta.id.len()).max().unwrap_or(0);
     let w1 = stews
         .iter()
@@ -466,13 +508,4 @@ fn table(stews: &[Tracked]) -> String {
         }
     }
     out
-}
-
-fn age(secs: i64) -> String {
-    match secs.max(0) {
-        s if s < 60 => "now".into(),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
 }
