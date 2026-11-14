@@ -23,6 +23,14 @@
         default = stew;
       });
 
+      # `services.stew` (nix/home-manager.nix) with this flake's package
+      homeManagerModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/home-manager.nix ];
+          services.stew.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.stew;
+        };
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [

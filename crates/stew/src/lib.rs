@@ -3,10 +3,13 @@
 pub mod catalog;
 pub mod config;
 pub mod daemon;
+pub mod driver;
 pub mod error;
 pub mod git;
 pub mod id;
+pub mod inspect;
 pub mod mirror;
+pub mod ops;
 pub mod paths;
 pub mod readme;
 pub mod refs;

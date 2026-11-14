@@ -1,11 +1,17 @@
 //! The hub daemon: one request per connection, JSON lines (stew-proto). It never touches a
-//! stew dir; it reaches remotes with `git` and (later) sites with `bento`.
+//! stew's files; it reaches remotes with `git` and sites through their drivers.
+//!
+//! Under systemd it takes its socket from socket activation (`LISTEN_FDS`) and, with
+//! `--idle-exit`, exits when no request has come for that long and nothing is in progress.
 
+use std::collections::BTreeSet;
 use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use stew_proto::{Call, Reply, Request, VERSION, recv, send};
@@ -20,14 +26,21 @@ use crate::state::StateFile;
 
 pub struct Hub {
     pub paths: Paths,
+    /// The socket clients reach this hub on (the host driver's `STEW_HUB`).
+    pub socket: PathBuf,
     /// Serializes git in the mirror (concurrent fetches fight over its lock files).
     mirror: Mutex<()>,
     pub state: Mutex<StateFile>,
+    /// Stews a command is working on.
+    busy: Mutex<BTreeSet<String>>,
+    /// Requests being handled, and when the last one ended (for `--idle-exit`).
+    active: AtomicUsize,
+    last: Mutex<Instant>,
 }
 
 impl Hub {
     /// Loads the state file and marks creations a previous daemon left running as failed.
-    pub fn open(paths: Paths) -> Result<Self> {
+    pub fn open(paths: Paths, socket: PathBuf) -> Result<Self> {
         let mut state = StateFile::load(&paths.state_file())?;
         let failed = state.recover();
         if !failed.is_empty() {
@@ -39,9 +52,37 @@ impl Hub {
         }
         Ok(Hub {
             paths,
+            socket,
             mirror: Mutex::new(()),
             state: Mutex::new(state),
+            busy: Mutex::new(BTreeSet::new()),
+            active: AtomicUsize::new(0),
+            last: Mutex::new(Instant::now()),
         })
+    }
+
+    pub fn mirror_lock(&self) -> MutexGuard<'_, ()> {
+        self.mirror.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn busy_ids(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.busy.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Idle: no request being handled, no creation in progress, none for `idle`.
+    fn idle_for(&self, idle: Duration) -> bool {
+        self.active.load(Ordering::SeqCst) == 0
+            && !self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .in_progress()
+            && self
+                .last
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .elapsed()
+                >= idle
     }
 
     pub fn handle(&self, req: Request) -> Reply {
@@ -73,9 +114,39 @@ impl Hub {
                     refs::resolve_new(&entries, base.as_deref(), here.as_ref())?;
                 Ok(Reply::Resolved { repos, warnings })
             }
+            Call::New {
+                repos,
+                title,
+                site,
+                branch,
+                base,
+                here,
+                from,
+            } => self.new_stew(crate::ops::NewArgs {
+                repos,
+                title,
+                site,
+                branch,
+                base,
+                here,
+                from,
+            }),
+            Call::Open { id, site } => self.open_stew(&id, site.as_deref()),
+            Call::Remove { id, force } => self.remove(&id, force, false),
+            Call::Close { id, force } => self.remove(&id, force, true),
+            Call::Start { id } => self.start(id.as_deref()),
+            Call::Stop { id } => self.stop(&id),
+            Call::Title { id, title } => self.title(&id, &title),
+            Call::Ls => self.ls(),
+            Call::Where {
+                id,
+                argv,
+                no_start,
+                tty,
+            } => self.launch(&id, &argv, no_start, tty),
             Call::LsAll { search, closed } => {
                 let mirror = self.mirror(&config)?;
-                let _lock = self.mirror.lock().unwrap_or_else(|p| p.into_inner());
+                let _lock = self.mirror_lock();
                 mirror.ensure()?;
                 let mut warnings = Vec::new();
                 // an unreachable remote is normal: list what the mirror has
@@ -95,6 +166,20 @@ impl Hub {
     }
 }
 
+/// The socket systemd passed (socket activation: `LISTEN_PID` is us, `LISTEN_FDS` ≥ 1,
+/// the first at fd 3), if any.
+pub fn activated() -> Option<UnixListener> {
+    use std::os::fd::FromRawFd;
+    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    let fds: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if pid != std::process::id() || fds < 1 {
+        return None;
+    }
+    // SAFETY: systemd hands fd 3 to this process as a listening socket; nothing else in
+    // the process owns it.
+    Some(unsafe { UnixListener::from_raw_fd(3) })
+}
+
 /// Binds `socket` (replacing a stale socket file, refusing a live one), owner-only.
 pub fn bind(socket: &Path) -> Result<UnixListener> {
     if let Some(dir) = socket.parent() {
@@ -112,9 +197,21 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serves until killed, a thread per connection.
-pub fn serve(hub: Arc<Hub>, listener: UnixListener, socket: PathBuf) -> Result<()> {
-    eprintln!("stew daemon: listening on {}", socket.display());
+/// Serves until killed (or idle for `idle_exit`), a thread per connection.
+pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>) -> Result<()> {
+    eprintln!("stew daemon: listening on {}", hub.socket.display());
+    if let Some(idle) = idle_exit {
+        let hub = hub.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1).min(idle));
+                if hub.idle_for(idle) {
+                    eprintln!("stew daemon: idle, exiting");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
@@ -124,10 +221,13 @@ pub fn serve(hub: Arc<Hub>, listener: UnixListener, socket: PathBuf) -> Result<(
             }
         };
         let hub = hub.clone();
+        hub.active.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             if let Err(e) = connection(&hub, conn) {
                 eprintln!("stew daemon: {e}");
             }
+            *hub.last.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+            hub.active.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())

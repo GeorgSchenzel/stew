@@ -1,0 +1,12 @@
+# stew's hub daemon (user unit), started by stew.socket. `stew` and `bento` by name from
+# the home-manager profile, never a store path, so upgrades don't leave it stale.
+# Same as nix/home-manager.nix (`services.stew`).
+[Unit]
+Description=stew hub daemon
+Requires=stew.socket
+After=stew.socket
+
+[Service]
+ExecStart=%h/.nix-profile/bin/stew daemon --idle-exit 600
+Environment=PATH=%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin
+Environment=GIT_TERMINAL_PROMPT=0

@@ -1,0 +1,12 @@
+# stew's hub socket (user unit). Socket activation: the daemon starts on the first
+# connection and exits when idle. Same as nix/home-manager.nix (`services.stew`).
+[Unit]
+Description=stew hub socket
+
+[Socket]
+ListenStream=%t/stew/stew.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

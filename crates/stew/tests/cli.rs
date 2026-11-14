@@ -214,8 +214,10 @@ fn errors_reach_the_cli() {
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("no artifacts repo"), "{}", r.stderr);
 
+    // stews on a site still list without the mirror, with a warning
     let r = env.stew(&["ls"], &d.socket);
-    assert_eq!(r.code, 1);
+    assert_eq!((r.code, r.stdout.as_str()), (0, ""));
+    assert!(r.stderr.contains("no artifacts repo"), "{}", r.stderr);
 
     let r = env.stew(&["ls", "--all"], &env.base.join("nobody.sock"));
     assert_eq!(r.code, 1);

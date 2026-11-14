@@ -1,0 +1,304 @@
+//! Drivers put a stew somewhere and isolate it; a site is a named driver with its settings
+//! (`~/.config/stew/config.yaml`, `sites:`). The trait is stew-internal and small on purpose:
+//! everything else (clones, git, the pushed check, the snapshot) is stew's code run through
+//! `exec`, the same for every driver.
+
+pub mod bento;
+pub mod host;
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::config::{DriverKind, Site};
+use crate::error::{Result, fail};
+use crate::paths::Paths;
+
+/// A stew as a driver sees it: its id and the env every process in it gets.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub id: String,
+    /// Given at `create` (bento keeps it in its state; host adds it to every process).
+    pub env: Vec<(String, String)>,
+}
+
+/// A command line to run where the stew lives, from wherever the hub runs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Launch {
+    pub argv: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecOpts {
+    /// Fail at once on a stopped stew instead of starting it.
+    pub no_start: bool,
+    /// A pty (the caller has a TTY).
+    pub tty: bool,
+    /// Stdin is forwarded.
+    pub stdin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The command's own exit code (128+n for a signal).
+    Exited(i32),
+    /// `no_start` and the stew isn't running.
+    NotRunning,
+    /// The stew doesn't exist on its site.
+    NoBox,
+}
+
+#[derive(Debug)]
+pub struct Output {
+    pub status: Status,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl Output {
+    pub fn ok(&self) -> bool {
+        self.status == Status::Exited(0)
+    }
+
+    pub fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    /// A one-line reason for a failure: stderr's last lines, or the status.
+    pub fn reason(&self) -> String {
+        let err = String::from_utf8_lossy(&self.stderr);
+        let err = err.trim();
+        let status = match self.status {
+            Status::Exited(c) => format!("exit {c}"),
+            Status::NotRunning => "not running".into(),
+            Status::NoBox => "no such box".into(),
+        };
+        if err.is_empty() {
+            status
+        } else {
+            let tail: Vec<&str> = err.lines().rev().take(3).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            format!("{} ({status})", tail.join("; "))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxState {
+    Running,
+    Stopped,
+    /// Not on the site.
+    Missing,
+    /// The driver's own word for anything else (bento: `creating`, `unknown`).
+    Other(String),
+}
+
+impl BoxState {
+    pub fn word(&self) -> &str {
+        match self {
+            BoxState::Running => "running",
+            BoxState::Stopped => "stopped",
+            BoxState::Missing => "missing",
+            BoxState::Other(w) => w,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Port {
+    pub guest: u16,
+    /// Where the host reaches it; opaque (show or dial it, never derive it).
+    pub address: Option<String>,
+}
+
+/// Which remotes that are local paths survive a `remove` (the pushed check counts only
+/// those): none in a box, those outside the root on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRemotes {
+    None,
+    OutsideRoot,
+}
+
+impl LocalRemotes {
+    pub fn word(self) -> &'static str {
+        match self {
+            LocalRemotes::None => "none",
+            LocalRemotes::OutsideRoot => "outside",
+        }
+    }
+}
+
+pub trait Driver: Send + Sync {
+    fn kind(&self) -> DriverKind;
+    /// Makes the stew's place and starts it; returns its root.
+    fn create(&self, t: &Target) -> Result<String>;
+    /// Starts it (bento: also applies the repos' ports live on a running box). Warnings.
+    fn start(&self, t: &Target) -> Result<Vec<String>>;
+    /// Stops it. Warnings (a driver that can't stop says so).
+    fn stop(&self, t: &Target) -> Result<Vec<String>>;
+    /// Takes it off the site, everything in it.
+    fn remove(&self, t: &Target) -> Result<()>;
+    /// Its state; an error means the site is unreachable.
+    fn state(&self, t: &Target) -> Result<BoxState>;
+    /// The command line that runs `argv` in the root (for `exec`, and the client's own).
+    fn launch(&self, t: &Target, argv: &[String], opts: &ExecOpts) -> Result<Launch>;
+    /// The command line of an interactive shell in the root.
+    fn enter(&self, t: &Target) -> Result<Launch>;
+    /// Runs `argv` in the root with `stdin`, waits (at most `timeout`).
+    fn exec(
+        &self,
+        t: &Target,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        no_start: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Output>;
+    /// Copies a host file or dir into the stew (`guest` relative to the root) or out of it.
+    fn cp_in(&self, t: &Target, host: &Path, guest: &str) -> Result<()>;
+    fn cp_out(&self, t: &Target, guest: &str, host: &Path) -> Result<()>;
+    fn ports(&self, t: &Target) -> Result<Vec<Port>>;
+    fn local_remotes(&self) -> LocalRemotes;
+}
+
+/// The driver for a site. `hub` is the address the host driver gives its stews in `STEW_HUB`.
+pub fn for_site(site: &Site, paths: &Paths, hub: &str) -> Box<dyn Driver> {
+    match site.driver {
+        DriverKind::Bento => Box::new(bento::Bento::new(site.via.as_deref())),
+        DriverKind::Host => {
+            let dir = site
+                .root
+                .as_deref()
+                .map_or_else(|| paths.home.join("projects/stews"), |r| paths.expand(r));
+            Box::new(host::Host::new(dir, hub.to_string()))
+        }
+    }
+}
+
+/// Runs a launch with `stdin` (none: empty), collecting both streams; killed (by its PID)
+/// after `timeout`. The exit code is 128+n for a signal, as a shell reports it.
+pub fn run(
+    launch: &Launch,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    let (prog, args) = launch
+        .argv
+        .split_first()
+        .ok_or_else(|| fail!("empty command"))?;
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
+        .envs(launch.env.iter().map(|(k, v)| (k, v)))
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = &launch.cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd.spawn().map_err(|e| fail!("cannot run {prog}: {e}"))?;
+    let mut out_pipe = child.stdout.take().expect("piped");
+    let mut err_pipe = child.stderr.take().expect("piped");
+    let in_pipe = child.stdin.take();
+    std::thread::scope(|s| {
+        if let (Some(data), Some(mut pipe)) = (stdin, in_pipe) {
+            s.spawn(move || {
+                let _ = pipe.write_all(data);
+            });
+        }
+        let out = s.spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let err = s.spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Ok(st),
+                Ok(None) => {}
+                Err(e) => break Err(fail!("waiting for {prog}: {e}")),
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(fail!(
+                    "{prog} took longer than {}s",
+                    timeout.unwrap_or_default().as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let out = out.join().unwrap_or_default();
+        let err = err.join().unwrap_or_default();
+        let st = status?;
+        use std::os::unix::process::ExitStatusExt;
+        let code = st
+            .code()
+            .or_else(|| st.signal().map(|n| 128 + n))
+            .unwrap_or(1);
+        Ok((code, out, err))
+    })
+}
+
+/// Quotes a word for a POSIX shell (for `via` commands like ssh, which join their
+/// arguments into one shell line).
+pub fn shell_quote(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("abc-1/x"), "abc-1/x");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("$(x)"), "'$(x)'");
+    }
+
+    #[test]
+    fn runs_with_stdin_and_timeout() {
+        let l = Launch {
+            argv: vec!["sh".into(), "-c".into(), "cat; echo err >&2; exit 3".into()],
+            cwd: None,
+            env: vec![],
+        };
+        let (code, out, err) = run(&l, Some(b"hi"), None).unwrap();
+        assert_eq!((code, &out[..], &err[..]), (3, &b"hi"[..], &b"err\n"[..]));
+        let slow = Launch {
+            argv: vec!["sleep".into(), "5".into()],
+            cwd: None,
+            env: vec![],
+        };
+        let t = Instant::now();
+        assert!(run(&slow, None, Some(Duration::from_millis(200))).is_err());
+        assert!(t.elapsed() < Duration::from_secs(3));
+        let kill = Launch {
+            argv: vec!["sh".into(), "-c".into(), "kill -9 $$".into()],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(run(&kill, None, None).unwrap().0, 137);
+    }
+}

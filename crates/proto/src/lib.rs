@@ -59,6 +59,62 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         closed: bool,
     },
+    /// A new stew: resolve, claim, create on the site, clone, start.
+    New {
+        repos: Vec<String>,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+        /// `--branch`: `Some("")` for the bare flag (the title's slug).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        here: Option<Here>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
+    /// A tracked stew recreated on a site; a closed one is reopened.
+    Open {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+    },
+    /// Off its site, after the pushed check (`force` skips its refusal).
+    Remove {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
+    /// `Remove` plus `state: closed` and a LOG.md line.
+    Close {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
+    /// The driver's start: one stew, or every stew on a site with `id: None`.
+    Start {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// The snapshot, a warning about unpushed work, the driver's stop.
+    Stop { id: String },
+    /// A new title, written to `stew.yaml` where the stew lives.
+    Title { id: String, title: String },
+    /// Stews that exist on a site, with what they show live.
+    Ls,
+    /// Where a command runs for `exec` and `enter` (the client runs it itself).
+    Where {
+        id: String,
+        /// Empty: an interactive shell (`enter`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_start: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tty: bool,
+    },
 }
 
 /// The repo a client runs in, which implies its current branch as that repo's base.
@@ -85,10 +141,68 @@ pub enum Reply {
         stews: Vec<Tracked>,
         warnings: Vec<String>,
     },
+    /// `new` and `open`: the stew exists.
+    Created {
+        id: String,
+        warnings: Vec<String>,
+    },
+    /// A command that has nothing else to say.
+    Done {
+        warnings: Vec<String>,
+    },
+    Live {
+        stews: Vec<Live>,
+        /// Creations in progress or failed.
+        creations: Vec<CreationInfo>,
+        warnings: Vec<String>,
+    },
+    /// Run this (for `exec`/`enter`): argv, in `cwd` when set, with `env` added.
+    Launch {
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
+    },
     Error {
         kind: ErrorKind,
         message: String,
     },
+}
+
+/// A stew that exists on a site, as `stew ls` shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Live {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub site: String,
+    /// `running`, `stopped`, `missing`, `unreachable`, or the driver's own word.
+    pub state: String,
+    /// Clones and their branches: live when running, else the last snapshot.
+    pub repos: Vec<LiveRepo>,
+    /// README's Now lines (live when running, else from the notes branch).
+    pub now: Vec<String>,
+    /// Unix time of the last commit on its notes branch (0: unknown).
+    pub updated: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveRepo {
+    pub dir: String,
+    /// Empty when detached or unknown.
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreationInfo {
+    pub id: String,
+    /// `running` or `failed`.
+    pub state: String,
+    pub started: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

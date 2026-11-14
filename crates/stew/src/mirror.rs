@@ -179,6 +179,33 @@ impl Mirror {
         search: Option<&str>,
         closed: bool,
     ) -> Result<(Vec<Tracked>, Vec<String>)> {
+        let search = search.map(str::trim).filter(|t| !t.is_empty());
+        let (mut out, warnings) =
+            self.load(|meta| search.is_some() || meta.is_closed() == closed)?;
+        if let Some(term) = search {
+            let lower = term.to_lowercase();
+            let hit = |t: &Tracked| {
+                t.meta.id.contains(&lower) || t.meta.title.to_lowercase().contains(&lower)
+            };
+            let rest: Vec<&str> = out
+                .iter()
+                .filter(|t| !hit(t))
+                .map(|t| t.meta.id.as_str())
+                .collect();
+            let in_notes = self.grep(term, &rest)?;
+            out.retain(|t| hit(t) || in_notes.contains(&t.meta.id));
+        }
+        Ok((out, warnings))
+    }
+
+    /// Every tracked stew, open or closed, most recent first.
+    pub fn every(&self) -> Result<(Vec<Tracked>, Vec<String>)> {
+        self.load(|_| true)
+    }
+
+    /// The tracked stews `keep` accepts, most recent first, with warnings for unreadable
+    /// `stew.yaml` files.
+    fn load(&self, keep: impl Fn(&StewMeta) -> bool) -> Result<(Vec<Tracked>, Vec<String>)> {
         let listing = git(
             &self.dir,
             [
@@ -195,7 +222,6 @@ impl Mirror {
             .collect();
         let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
         let files = self.read_files(&ids, &["stew.yaml", "README.md"])?;
-        let search = search.map(str::trim).filter(|t| !t.is_empty());
         let mut warnings = Vec::new();
         let mut out = Vec::new();
         for ((id, updated), mut found) in rows.iter().zip(files) {
@@ -211,7 +237,7 @@ impl Mirror {
                     continue;
                 }
             };
-            if search.is_none() && meta.is_closed() != closed {
+            if !keep(&meta) {
                 continue;
             }
             let summary = readme::summarize(readme.as_deref().unwrap_or_default());
@@ -221,19 +247,6 @@ impl Mirror {
                 description: summary.description,
                 now: summary.now,
             });
-        }
-        if let Some(term) = search {
-            let lower = term.to_lowercase();
-            let hit = |t: &Tracked| {
-                t.meta.id.contains(&lower) || t.meta.title.to_lowercase().contains(&lower)
-            };
-            let rest: Vec<&str> = out
-                .iter()
-                .filter(|t| !hit(t))
-                .map(|t| t.meta.id.as_str())
-                .collect();
-            let in_notes = self.grep(term, &rest)?;
-            out.retain(|t| hit(t) || in_notes.contains(&t.meta.id));
         }
         Ok((out, warnings))
     }
