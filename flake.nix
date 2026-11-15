@@ -47,26 +47,49 @@
           };
           stand-in-bento = pkgs.hello;
           # the module itself, evaluated with stand-ins for home-manager's options
-          module = lib.evalModules {
-            modules = [
-              self.homeManagerModules.default
-              {
-                options = with lib; {
-                  assertions = mkOption { type = types.listOf types.attrs; };
-                  home.packages = mkOption { type = types.listOf types.package; };
-                  systemd.user = mkOption { type = types.attrsOf types.anything; };
-                  programs.bento.enable = mkOption { type = types.bool; };
-                  programs.bento.package = mkOption { type = types.package; };
-                };
-                config.services.stew.enable = true;
-                config.programs.bento = {
-                  enable = true;
-                  package = stand-in-bento;
-                };
-                config._module.args.pkgs = pkgs;
-              }
-            ];
-          };
+          eval =
+            extra:
+            lib.evalModules {
+              modules = [
+                self.homeManagerModules.default
+                extra
+                {
+                  options = with lib; {
+                    assertions = mkOption { type = types.listOf types.attrs; };
+                    home.packages = mkOption { type = types.listOf types.package; };
+                    home.file = mkOption {
+                      type = types.attrsOf types.anything;
+                      default = { };
+                    };
+                    xdg.configFile = mkOption {
+                      type = types.attrsOf types.anything;
+                      default = { };
+                    };
+                    systemd.user = mkOption { type = types.attrsOf types.anything; };
+                    programs.bento.enable = mkOption { type = types.bool; };
+                    programs.bento.package = mkOption { type = types.package; };
+                  };
+                  config.services.stew.enable = true;
+                  config.programs.bento = {
+                    enable = true;
+                    package = stand-in-bento;
+                  };
+                  config._module.args.pkgs = pkgs;
+                }
+              ];
+            };
+          module = eval { };
+          # hostSkills: off by default; on, both agents' dirs link the two skills from the package
+          skilled = (eval { services.stew.hostSkills.enable = true; }).config;
+          skillFiles = [
+            "stew/SKILL.md"
+            "herdr-core/SKILL.md"
+          ];
+          links = skilled.home.file // skilled.xdg.configFile;
+          wanted = lib.concatMap (n: [
+            ".claude/skills/${n}"
+            "opencode/skills/${n}"
+          ]) skillFiles;
           units = module.config.systemd.user;
           # without string context: the check doesn't build what the units name
           plain = builtins.unsafeDiscardStringContext (builtins.toJSON units);
@@ -102,6 +125,21 @@
               stand-in-bento
             ]) "the agents' tools or bento are not on the units' PATH";
             pkgs.writeText "stew-units.json" plain;
+          host-skills =
+            assert module.config.home.file == { } && module.config.xdg.configFile == { };
+            assert lib.attrNames links == lib.sort lib.lessThan wanted;
+            assert builtins.all (
+              n: lib.hasPrefix "${self.packages.${system}.stew}/share/stew/skills/" links.${n}.source
+            ) wanted;
+            # the linked files exist and are the skills the binary carries
+            pkgs.runCommand "stew-host-skills" { } ''
+              ${lib.concatMapStrings (n: ''
+                test -f ${links.${n}.source}
+              '') wanted}
+              s=${self.packages.${system}.stew}
+              $s/bin/stew skill | cmp - $s/share/stew/skills/stew/SKILL.md
+              touch $out
+            '';
         }
       );
 

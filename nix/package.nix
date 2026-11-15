@@ -49,8 +49,10 @@ rustPlatform.buildRustPackage {
       ''
     else
       ''
-        mkdir -p $out/libexec/stew
+        mkdir -p $out/libexec/stew $out/share/stew
         mv $out/bin/stew-box $out/libexec/stew/stew
+        # the skills `stew skills` assembles (stew's and hc's stub), for `hostSkills`
+        cp -r ${../skills} $out/share/stew/skills
         wrapProgram $out/bin/stew \
           --suffix PATH : ${lib.makeBinPath [ gitMinimal ]}
       '';

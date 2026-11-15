@@ -343,6 +343,12 @@ fn socket_and_state_on_start() {
             "creations":{"b-0000":{"state":"running","started":5},"c-0000":{"state":"failed","started":1,"error":"x"}}}"#,
     );
     let d = env.daemon();
+    // the socket accepts before the state is recovered; a reply comes after it
+    let _ = d.call(Call::Resolve {
+        repos: vec!["nope".into()],
+        base: None,
+        here: None,
+    });
     let v: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
     assert_eq!(v["creations"]["b-0000"]["state"], "failed");
     assert!(

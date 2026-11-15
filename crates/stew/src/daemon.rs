@@ -220,13 +220,10 @@ impl Hub {
                 self.ls_from(&id)
             }
             Call::Skills => {
-                let mirror = match config.artifacts {
-                    Some(_) => Some(self.mirror(&config)?),
-                    None => None,
-                };
+                // one assembly at a time (they share the temporary file names)
                 let _lock = self.mirror_lock();
-                let warnings = crate::skills::assemble(&self.paths.skills(), mirror.as_ref())?;
-                Ok(Reply::Done { warnings })
+                crate::skills::assemble(&self.paths.skills())?;
+                Ok(Reply::Done { warnings: vec![] })
             }
             Call::Open { id, site } => self.open_stew(&id, site.as_deref()),
             Call::Remove { id, force } => self.remove(&id, force, false),

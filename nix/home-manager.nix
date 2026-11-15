@@ -3,6 +3,8 @@
 # hourly timer (sessions export to the transcripts repo, the skills dir). The
 # packages default to this flake's and nixpkgs'; the units use their store paths, never a
 # profile, so what host stews' agents may run is `agentPackages` (and `extraPackages`).
+# `hostSkills.enable` (off by default) links the stew skill and hc's stub, from the package,
+# into the host's claude and opencode skills dirs.
 # (The bento side, the `stew` channel, the in-box client and hc as box tools, the skills
 # dir, HC_SESSION and STEW_HUB in bento's global config, comes with bento v2's module: B5.)
 self: systems:
@@ -78,6 +80,10 @@ in
         and the pushed check, so every remove is refused).
       '';
     };
+    hostSkills.enable = lib.mkEnableOption ''
+      the stew skill and hc's stub for the host's own agents: linked into
+      `~/.claude/skills/` and `~/.config/opencode/skills/` from the stew package
+      (`share/stew/skills`), store paths only. Independent of `enable`'';
     idleExit = lib.mkOption {
       type = lib.types.ints.positive;
       default = 600;
@@ -85,29 +91,44 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions = [
+  config = lib.mkMerge [
+    (lib.mkIf cfg.hostSkills.enable (
+      let
+        skill = n: { source = "${cfg.package}/share/stew/skills/${n}/SKILL.md"; };
+        links = dir: {
+          "${dir}/stew/SKILL.md" = skill "stew";
+          "${dir}/herdr-core/SKILL.md" = skill "herdr-core";
+        };
+      in
       {
-        assertion = supported;
-        message = "stew's hub is only packaged for ${lib.concatStringsSep ", " systems} (hc's release builds).";
+        home.file = links ".claude/skills";
+        xdg.configFile = links "opencode/skills";
       }
-    ];
+    ))
+    (lib.mkIf cfg.enable {
+      assertions = [
+        {
+          assertion = supported;
+          message = "stew's hub is only packaged for ${lib.concatStringsSep ", " systems} (hc's release builds).";
+        }
+      ];
 
-    home.packages = lib.mkIf supported [
-      cfg.package
-      cfg.hcPackage
-    ];
+      home.packages = lib.mkIf supported [
+        cfg.package
+        cfg.hcPackage
+      ];
 
-    systemd.user = lib.mkIf supported (
-      import ./units.nix {
-        inherit lib pkgs;
-        stew = cfg.package;
-        hc = cfg.hcPackage;
-        # the git the user's config is written for (helpers by store path)
-        git = config.programs.git.package or pkgs.git;
-        packages = cfg.agentPackages ++ cfg.extraPackages;
-        inherit (cfg) idleExit;
-      }
-    );
-  };
+      systemd.user = lib.mkIf supported (
+        import ./units.nix {
+          inherit lib pkgs;
+          stew = cfg.package;
+          hc = cfg.hcPackage;
+          # the git the user's config is written for (helpers by store path)
+          git = config.programs.git.package or pkgs.git;
+          packages = cfg.agentPackages ++ cfg.extraPackages;
+          inherit (cfg) idleExit;
+        }
+      );
+    })
+  ];
 }

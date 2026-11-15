@@ -22,8 +22,10 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
   the stew's root) into the hub's checkout of the transcripts repo,
   `<id>/<agent>-<session>.json[l]` plus `.meta.json`; on `stop`, `remove` (fail-closed) and
   hourly (`stew export --all`), committed daily or at once on `stop`/`remove`/`--push`.
-- `skills/stew/SKILL.md`: the stew skill (`stew skill` prints it; `stew skills` assembles
-  `~/.local/share/stew/skills/` with hc's stub and the artifacts repo's `main:skills/`).
+- `skills/`: the stew skill (`stew skill` prints it) and hc's stub; `stew skills` assembles
+  `~/.local/share/stew/skills/` with exactly these two (no workflow skills), the package
+  carries them in `share/stew/skills`, and `services.stew.hostSkills.enable` links them into
+  the host's `~/.claude/skills/` and `~/.config/opencode/skills/` (off by default).
 
 Development (no cargo on the host): `nix develop --no-pure-eval -c just test`, and
 `just check` for fmt and clippy. The dev shell has hc; the runtime tests run their own hub
