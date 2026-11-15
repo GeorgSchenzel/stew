@@ -37,9 +37,14 @@ let
 in
 {
   sockets.stew = {
-    Unit.Description = "stew hub socket";
+    Unit.Description = "stew hub sockets (the host CLI's, the stews')";
     Socket = {
-      ListenStream = "%t/stew/stew.sock";
+      # in this order: the daemon takes fd 3 as the CLI's, fd 4 as the stews' (`STEW_HUB`,
+      # the bento channel's host socket), where every request must name its stew
+      ListenStream = [
+        "%t/stew/stew.sock"
+        "%t/stew/box.sock"
+      ];
       SocketMode = "0600";
       DirectoryMode = "0700";
     };

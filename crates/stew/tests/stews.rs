@@ -180,6 +180,19 @@ fn yaml(text: &str) -> serde_yaml::Value {
 #[test]
 fn new_remove_open_close() {
     let t = setup();
+    // `runtime: none` can start no agent: refused before anything is claimed or made
+    let r = t.stew_in(
+        &["new", "a", "--title", "No agent", "--brief", "-", "--start"],
+        &t.env.base,
+        Some(b"b"),
+    );
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("no agent runtime"), "{}", r.stderr);
+    assert!(
+        t.git(&t.notes, &["for-each-ref", "refs/heads/stew/"])
+            .is_empty(),
+        "nothing claimed"
+    );
     let id = t.create(&["a", "b", "--title", "Test it"]);
     assert!(id.starts_with("test-it-"), "{id}");
     let root = t.root(&id);
@@ -240,7 +253,11 @@ fn new_remove_open_close() {
     assert_eq!(r.code, 7, "{}", r.stderr);
     assert_eq!(
         r.stdout,
-        format!("in\n{}\nunix:{}\n", root.display(), t.d.socket.display())
+        format!(
+            "in\n{}\nunix:{}\n",
+            root.display(),
+            t.d.socket.with_file_name("box.sock").display()
+        )
     );
     assert_ne!(t.stew(&["exec", "nope-0000", "--", "true"]).code, 0);
 

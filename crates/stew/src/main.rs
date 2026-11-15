@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use stew::daemon::{self, Hub};
 use stew::error::{Error, Result};
 use stew::paths::Paths;
-use stew_proto::show::{age, live_table, now};
+use stew_proto::show::{age, live_table, now, printable};
 use stew_proto::{Call, Here, Reply, Request, Tracked};
 
 /// Stews: workspaces of repo clones in a box.
@@ -140,7 +140,8 @@ enum Cmd {
     },
     /// The hub's daemon (systemd starts it on demand; in tests, in the foreground)
     Daemon {
-        /// Listen here instead of $XDG_RUNTIME_DIR/stew/stew.sock (or systemd's socket)
+        /// Listen here instead of $XDG_RUNTIME_DIR/stew/stew.sock (or systemd's socket); the
+        /// stews' socket is `box.sock` next to it
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
         /// Exit after this many seconds without a request (none in progress)
@@ -164,15 +165,21 @@ fn run(cli: Cli) -> Result<u8> {
     match cli.cmd {
         Cmd::Daemon { socket, idle_exit } => {
             let idle = idle_exit.map(Duration::from_secs);
-            let (listener, socket) = match (socket, daemon::activated()) {
-                (None, Some(l)) => (l, paths.socket()),
+            let (listener, stews, socket) = match (socket, daemon::activated()) {
+                (None, Some((l, stews))) => (l, stews, paths.socket()),
                 (socket, _) => {
                     let socket = socket.unwrap_or_else(|| paths.socket());
-                    (daemon::bind(&socket)?, socket)
+                    (daemon::bind(&socket)?, None, socket)
                 }
             };
-            let hub = Arc::new(Hub::open(paths, socket)?);
-            daemon::serve(hub, listener, idle)?;
+            // the stews' socket sits next to the CLI's
+            let box_socket = socket.with_file_name("box.sock");
+            let stews = match stews {
+                Some(l) => l,
+                None => daemon::bind(&box_socket)?,
+            };
+            let hub = Arc::new(Hub::open(paths, socket, box_socket)?);
+            daemon::serve(hub, listener, stews, idle)?;
             Ok(0)
         }
         Cmd::New {
@@ -329,9 +336,7 @@ fn run(cli: Cli) -> Result<u8> {
             else {
                 return Err(Error::Fail("unexpected reply from the daemon".into()));
             };
-            for w in &warnings {
-                eprintln!("stew: warning: {w}");
-            }
+            warn(&warnings);
             if waiting {
                 let lines: Vec<(&str, &str)> = stews
                     .iter()
@@ -346,7 +351,7 @@ fn run(cli: Cli) -> Result<u8> {
                 } else {
                     let w = lines.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
                     for (id, line) in lines {
-                        println!("{id:<w$}  {line}");
+                        println!("{id:<w$}  {}", printable(line));
                     }
                 }
             } else if json {
@@ -355,7 +360,7 @@ fn run(cli: Cli) -> Result<u8> {
                     serde_json::to_string_pretty(&stews).expect("serializes")
                 );
             } else {
-                print!("{}", table(&stews));
+                print!("{}", printable(&table(&stews)));
             }
             Ok(0)
         }
@@ -364,7 +369,7 @@ fn run(cli: Cli) -> Result<u8> {
 
 fn warn(warnings: &[String]) {
     for w in warnings {
-        eprintln!("stew: warning: {w}");
+        eprintln!("stew: warning: {}", printable(w));
     }
 }
 
@@ -487,11 +492,12 @@ fn read_brief(file: &str) -> Result<String> {
 /// One request to the daemon; its error replies become errors.
 fn call(paths: &Paths, call: Call) -> Result<Reply> {
     let socket = paths.socket();
-    let reply = stew_proto::call(&socket, &Request::new(call)).map_err(|e| {
-        Error::Fail(format!(
+    let reply = stew_proto::call(&socket, &Request::new(call)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidInput => Error::Fail(e.to_string()),
+        _ => Error::Fail(format!(
             "cannot reach the stew daemon at {}: {e}",
             socket.display()
-        ))
+        )),
     })?;
     match reply {
         Reply::Error { kind, message } => Err(Error::from_reply(kind, message)),

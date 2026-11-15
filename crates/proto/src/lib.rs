@@ -434,8 +434,18 @@ pub fn hub_socket(hub: &str) -> Result<std::path::PathBuf, String> {
 
 /// Sends `req` to the daemon at `socket` and returns its reply.
 pub fn call(socket: &Path, req: &Request) -> io::Result<Reply> {
+    // the daemon reads at most MAX_REQUEST: say so here instead of a cut-off line there
+    // (JSON escapes control characters, so a brief under MAX_BRIEF can still be too long)
+    let mut line = serde_json::to_vec(req)?;
+    line.push(b'\n');
+    if line.len() as u64 > MAX_REQUEST {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the request is longer than {MAX_REQUEST} bytes (as JSON)"),
+        ));
+    }
     let stream = UnixStream::connect(socket)?;
-    send(&mut &stream, req)?;
+    (&stream).write_all(&line)?;
     recv(&mut BufReader::new(&stream))?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,

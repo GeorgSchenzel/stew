@@ -86,7 +86,7 @@ impl Hub {
 
     fn driver(&self, config: &Config, site: Option<&str>) -> Result<(String, Box<dyn Driver>)> {
         let (name, site) = config.site(site)?;
-        let hub = self.socket.to_string_lossy();
+        let hub = self.box_socket.to_string_lossy();
         Ok((
             name,
             driver::for_site(&site, &self.paths, &hub, self.client.as_deref()),
@@ -158,6 +158,7 @@ impl Hub {
         }
         // the agent's command line, checked before anything exists
         let launch = if a.start {
+            runtime::can_run(&config)?;
             let (agent, model) = agent::choose(&config, a.agent.as_deref(), a.model.as_deref());
             Some((
                 agent.clone(),
@@ -213,6 +214,7 @@ impl Hub {
             feature.as_deref(),
             &mut warnings,
             None,
+            meta.from.as_deref(),
         )?;
         let agent = match launch {
             None => None,
@@ -274,6 +276,7 @@ impl Hub {
             None,
             &mut warnings,
             reopen,
+            meta.from.as_deref(),
         )?;
         Ok(Reply::Created {
             id: id.to_string(),
@@ -299,6 +302,7 @@ impl Hub {
         feature: Option<&str>,
         warnings: &mut Vec<String>,
         reopen: Option<StewMeta>,
+        from: Option<&str>,
     ) -> Result<()> {
         let _busy = self.busy(id)?;
         if let Some(p) = self
@@ -370,6 +374,7 @@ impl Hub {
                         Placed {
                             site: site.to_string(),
                             token: token.to_string(),
+                            from: from.map(String::from),
                         },
                     );
                 })?;
@@ -829,25 +834,26 @@ impl Hub {
         let config = Config::load(&self.paths)?;
         let (agent, model) = agent::choose(&config, agent, model);
         let argv = agent::command(&agent, model.as_deref(), task)?;
+        runtime::can_run(&config)?;
         let (placed, driver) = self.placed(&config, id)?;
         let mut warnings = Vec::new();
-        if let Some(c) = caller.filter(|c| *c != id) {
-            let from = self
-                .mirror_every(&config, &mut warnings)?
-                .into_iter()
-                .find(|t| t.meta.id == id)
-                .and_then(|t| t.meta.from);
-            if from.as_deref() != Some(c) {
-                return Err(Error::Refused(format!(
-                    "{id} was not started from {c}: agents go only into stews you started"
-                )));
-            }
+        // the daemon's own record, never a branch's stew.yaml (any stew can push those)
+        if let Some(c) = caller.filter(|c| *c != id)
+            && placed.from.as_deref() != Some(c)
+        {
+            return Err(Error::Refused(format!(
+                "{id} was not started from {c}: agents go only into stews you started"
+            )));
         }
-        let _busy = self.busy(id)?;
         let t = target(id, &placed.token);
-        warnings.extend(driver.start(&t)?);
         let rt = runtime::for_config(&config);
-        rt.connect(id, &runtime::via(id))?;
+        {
+            // starting and connecting are one command at a time; `hc run` is not (hc names
+            // concurrent agents apart), so two agents can start in one stew at once
+            let _busy = self.busy(id)?;
+            warnings.extend(driver.start(&t)?);
+            rt.connect(id, &runtime::via(id))?;
+        }
         let address = rt.run(id, &agent, &argv, &driver.root(&t)?)?;
         Ok(Reply::Started { address, warnings })
     }

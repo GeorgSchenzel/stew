@@ -60,6 +60,8 @@ impl Drop for Kid {
 struct T {
     env: Env,
     socket: PathBuf,
+    /// The stews' socket (`STEW_HUB`), next to the CLI's.
+    box_socket: PathBuf,
     stews: PathBuf,
     notes: PathBuf,
     log: PathBuf,
@@ -203,6 +205,7 @@ fn setup(slow_hc: bool) -> T {
     wait_for("the daemon", 10, || UnixStream::connect(&socket).is_ok());
     T {
         env,
+        box_socket: socket.with_file_name("box.sock"),
         socket,
         stews,
         notes,
@@ -316,7 +319,13 @@ impl T {
         state["stews"][id]["token"].as_str().unwrap().to_string()
     }
 
+    /// A request on the stews' socket, as a stew's client sends it.
     fn raw(&self, req: &Request) -> Reply {
+        stew_proto::call(&self.box_socket, req).unwrap()
+    }
+
+    /// A request on the host CLI's socket.
+    fn cli(&self, req: &Request) -> Reply {
         stew_proto::call(&self.socket, req).unwrap()
     }
 }
@@ -422,7 +431,7 @@ fn agents_start_stews_from_inside_one() {
     assert_eq!(get(&log, "pwd"), root.to_str().unwrap());
     assert_eq!(get(&log, "token"), t.token(&child));
     assert_ne!(t.token(&child), t.token(&parent));
-    assert_eq!(get(&log, "hub"), format!("unix:{}", t.socket.display()));
+    assert_eq!(get(&log, "hub"), format!("unix:{}", t.box_socket.display()));
     assert_eq!(get(&log, "session"), format!("stew-{child}"));
     assert_eq!(
         get(&log, "stew"),
@@ -477,7 +486,7 @@ fn agents_start_stews_from_inside_one() {
 
     // attach: the hub's hc, at the agent's address (by address or by a unique name)
     for name in [format!("{child}/claude-1"), "claude-1".into()] {
-        let Reply::Launch { argv, env, .. } = t.raw(&Request::new(Call::Attach { agent: name }))
+        let Reply::Launch { argv, env, .. } = t.cli(&Request::new(Call::Attach { agent: name }))
         else {
             panic!("no launch")
         };
@@ -612,8 +621,61 @@ fn the_token_and_what_a_stew_may_ask() {
         "not a stew id",
     );
     refused(
-        t.raw(&req(None, Some(&ta), Call::Repos)),
+        t.cli(&req(None, Some(&ta), Call::Repos)),
         "token without a stew",
+    );
+    // on the stews' socket, a request that names no stew is refused, whatever it asks: the
+    // host CLI's calls are not reachable from a stew
+    for call in [
+        Call::Repos,
+        Call::Remove {
+            id: b.clone(),
+            force: true,
+        },
+        Call::Start { id: None },
+        Call::Where {
+            id: b.clone(),
+            argv: vec!["true".into()],
+            no_start: false,
+            tty: false,
+        },
+        Call::New {
+            repos: vec!["a".into()],
+            title: "Host".into(),
+            site: Some("t".into()),
+            branch: None,
+            base: None,
+            here: None,
+            from: None,
+            brief: None,
+            start: false,
+            agent: None,
+            model: None,
+        },
+    ] {
+        refused(t.raw(&req(None, None, call.clone())), "names its stew");
+        refused(t.raw(&req(None, Some(&ta), call)), "names its stew");
+    }
+    // a stew's `new` names no site (it goes to the default one)
+    refused(
+        t.raw(&req(
+            Some(&a),
+            Some(&ta),
+            Call::New {
+                repos: vec!["a".into()],
+                title: "Site".into(),
+                site: Some("t".into()),
+                branch: None,
+                base: None,
+                here: None,
+                from: None,
+                brief: None,
+                start: false,
+                agent: None,
+                model: None,
+            },
+        )),
+        "default site",
     );
     // with its token, a stew still makes only a stew client's calls
     for call in [
@@ -740,6 +802,15 @@ fn the_token_and_what_a_stew_may_ask() {
         Some(&vec![b'b'; stew_proto::MAX_BRIEF + 1]),
     );
     assert!(r.stderr.contains("longer than"), "{}", r.stderr);
+    // under MAX_BRIEF, but over MAX_REQUEST as JSON (control characters are escaped): the
+    // client says so, instead of the daemon's cut-off line
+    let r = t.inside(
+        &a,
+        &["new", "a", "--title", "X", "--brief", "-"],
+        Some(&vec![1u8; 700_000]),
+    );
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("(as JSON)"), "{}", r.stderr);
     assert_eq!(fs::read_dir(&t.stews).unwrap().count(), n);
     let r = t.stew(&["agent", &a, "--dangerously-skip-permissions"]);
     assert_ne!(r.code, 0, "{}", r.stderr);
@@ -872,4 +943,87 @@ fn work_done_while_removing_is_not_lost() {
     assert!(!t.stews.join(&id).exists());
     assert!(tracked("stew.yaml").contains("state: closed"));
     assert_eq!(tracked("LOG.md").matches("closed").count(), 1);
+}
+
+/// R3: what any stew can push to the artifacts repo never makes it another stew's parent.
+/// A branch's `stew.yaml` speaks only for its own id, and `agent` asks the daemon's record.
+#[test]
+fn a_pushed_from_takes_over_no_stew() {
+    let t = setup(false);
+    let a = t
+        .ok(&["new", "a", "--title", "A"])
+        .stdout
+        .trim()
+        .to_string();
+    let b = t
+        .ok(&["new", "a", "--title", "B"])
+        .stdout
+        .trim()
+        .to_string();
+    let r = t.inside(&a, &["agent", &b, "go"], None);
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    assert!(r.stderr.contains("was not started from"), "{}", r.stderr);
+
+    // b's stew.yaml with `from: a`, pushed as a new, newer branch, then onto b's own
+    let work = t.env.base.join("spoof");
+    let notes = t.notes.to_str().unwrap();
+    let branch = format!("stew/{b}");
+    t.env.git(
+        &t.env.base,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            &branch,
+            notes,
+            work.to_str().unwrap(),
+        ],
+    );
+    let yaml = fs::read_to_string(work.join("stew.yaml")).unwrap();
+    let yaml: String = yaml
+        .lines()
+        .filter(|l| !l.starts_with("from:"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(work.join("stew.yaml"), format!("{yaml}from: {a}\n")).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    t.env.git(&work, &["commit", "-qam", "spoof"]);
+    t.env.git(
+        &work,
+        &["push", "-q", "origin", "HEAD:refs/heads/stew/zzzz-0000"],
+    );
+    let r = t.inside(&a, &["agent", &b, "go"], None);
+    assert_eq!(r.code, 2, "a spoof branch: {}", r.stderr);
+    assert!(r.stderr.contains("was not started from"), "{}", r.stderr);
+    // the other readers skip it too: b is not a's child, b's info is b's own
+    let r = t.inside(&a, &["ls", "--from", ".", "--json"], None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!r.stdout.contains(&b), "{}", r.stdout);
+    assert!(
+        r.stderr.contains("stew/zzzz-0000"),
+        "a warning: {}",
+        r.stderr
+    );
+    let r = t.inside(&b, &["info"], None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!r.stdout.contains(&format!("from    {a}")), "{}", r.stdout);
+
+    // on b's own branch (every stew can push there too): still not a's to start agents in
+    t.env
+        .git(&work, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
+    let r = t.inside(&a, &["agent", &b, "go"], None);
+    assert_eq!(r.code, 2, "b's own branch: {}", r.stderr);
+    // what the daemon recorded does: a child of a
+    let r = t.inside(
+        &a,
+        &["new", "a", "--title", "Child", "--brief", "-"],
+        Some(b"b"),
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let c = r.stdout.trim().to_string();
+    let r = t.inside(&a, &["agent", &c, "go"], None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    for id in [&a, &b, &c] {
+        t.ok(&["remove", "--force", id]);
+    }
 }

@@ -11,6 +11,15 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// `text` without control characters (C0, C1, DEL) except newlines: titles, Now lines and
+/// agents' status are written in stews, and an escape sequence must not reach the terminal
+/// of whoever lists them.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
+}
+
 /// `now`, `5m`, `3h`, `2d`.
 pub fn age(secs: i64) -> String {
     match secs.max(0) {
@@ -78,5 +87,16 @@ pub fn live_table(stews: &[Live], creations: &[CreationInfo]) -> String {
         };
         out.push_str(&format!("{}  {what}\n", c.id));
     }
-    out
+    printable(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn printable() {
+        assert_eq!(
+            super::printable("a\x1b]52;c;eA==\x07b\u{9b}2Jc\x7f\td\ne"),
+            "a]52;c;eA==b2Jcd\ne"
+        );
+    }
 }

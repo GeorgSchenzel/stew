@@ -230,7 +230,13 @@ impl Mirror {
                 Some(text) => parse_meta(&text),
                 None => Err(fail!("no stew.yaml")),
             };
+            // a branch speaks only for its own id: a `stew.yaml` copied (or pushed) into
+            // another branch never stands in for the stew it names
             let meta = match meta {
+                Ok(m) if m.id != *id => {
+                    warnings.push(format!("stew/{id}: its stew.yaml names {} (skipped)", m.id));
+                    continue;
+                }
                 Ok(m) => m,
                 Err(e) => {
                     warnings.push(format!("stew/{id}: {e}"));

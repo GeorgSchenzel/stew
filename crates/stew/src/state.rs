@@ -25,6 +25,11 @@ pub struct State {
 pub struct Placed {
     pub site: String,
     pub token: String,
+    /// The stew it was started from, as recorded here at `new` (the caller) or `open` (its
+    /// own branch's `stew.yaml`): what lets that stew start agents in it, never what a
+    /// box-writable branch says later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +132,7 @@ mod tests {
             Placed {
                 site: "desktop".into(),
                 token: "t".into(),
+                from: None,
             },
         );
         for (id, state) in [("b-0000", Progress::Running), ("c-0000", Progress::Failed)] {

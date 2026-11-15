@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
-use stew_proto::show::live_table;
+use stew_proto::show::{live_table, printable};
 use stew_proto::{Call, ErrorKind, Here, Reply, Request, StewMeta};
 
 /// Stews: workspaces of repo clones in a box (the client inside a stew).
@@ -90,7 +90,7 @@ fn unexpected(r: Reply) -> Failure {
 
 fn warn(warnings: &[String]) {
     for w in warnings {
-        eprintln!("stew: warning: {w}");
+        eprintln!("stew: warning: {}", printable(w));
     }
 }
 
@@ -231,11 +231,12 @@ fn call(call: Call) -> Result<Reply, Failure> {
         token: env::var("STEW_TOKEN").ok().filter(|t| !t.is_empty()),
         call,
     };
-    let reply = stew_proto::call(&socket, &req).map_err(|e| {
-        (
+    let reply = stew_proto::call(&socket, &req).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidInput => (1, e.to_string()),
+        _ => (
             1,
             format!("cannot reach the stew hub at {}: {e}", socket.display()),
-        )
+        ),
     })?;
     match reply {
         Reply::Error { kind, message } => {

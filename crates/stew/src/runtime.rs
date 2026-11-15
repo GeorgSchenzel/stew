@@ -49,6 +49,15 @@ pub fn for_config(config: &Config) -> Box<dyn Runtime> {
     }
 }
 
+/// Whether the config's runtime can start agents (checked before anything is claimed or
+/// started for one).
+pub fn can_run(config: &Config) -> Result<()> {
+    match config.runtime {
+        Some(RuntimeKind::None) => Err(fail!("{NONE}")),
+        _ => Ok(()),
+    }
+}
+
 /// `runtime: none`: stews without agents.
 pub struct NoRuntime;
 
