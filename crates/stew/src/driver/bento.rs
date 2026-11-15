@@ -62,7 +62,20 @@ impl Bento {
 
     /// `bento <args>`, behind `via` when set.
     pub fn argv<S: AsRef<str>>(&self, args: &[S]) -> Vec<String> {
+        self.argv_tty(args, false)
+    }
+
+    /// As `argv`; with `tty`, an ssh `via` asks for a remote pty (`ssh -t`), or the bento
+    /// there has no TTY for `enter` and `exec -t`.
+    fn argv_tty<S: AsRef<str>>(&self, args: &[S], tty: bool) -> Vec<String> {
         let mut argv = self.via.clone();
+        if tty
+            && argv
+                .first()
+                .is_some_and(|p| p.rsplit('/').next() == Some("ssh"))
+        {
+            argv.insert(1, "-t".into());
+        }
         let quote = !self.via.is_empty();
         argv.push("bento".into());
         argv.extend(args.iter().map(|a| {
@@ -195,8 +208,12 @@ impl Driver for Bento {
         Ok(self.ok(&["stop", &t.id], "bento stop", &t.id)?.1)
     }
 
-    fn remove(&self, t: &Target) -> Result<()> {
-        let (code, _, err) = self.bento(&["rm", &t.id], None)?;
+    fn remove(&self, t: &Target, force: bool) -> Result<()> {
+        let mut args = vec!["rm", &t.id];
+        if force {
+            args.push("--force");
+        }
+        let (code, _, err) = self.bento(&args, None)?;
         match code {
             0 | NO_SUCH_BOX => Ok(()),
             _ => Err(fail!("bento rm {}: {} (exit {code})", t.id, message(&err))),
@@ -226,11 +243,20 @@ impl Driver for Bento {
         if opts.tty {
             args.push("-t".into());
         }
+        if let Some(cwd) = &opts.cwd {
+            super::check_cwd(cwd)?;
+            args.push("-w".into());
+            args.push(if cwd.starts_with('/') {
+                cwd.clone()
+            } else {
+                format!("{ROOT}/{cwd}")
+            });
+        }
         args.push(t.id.clone());
         args.push("--".into());
         args.extend(argv.iter().cloned());
         Ok(Launch {
-            argv: self.argv(&args),
+            argv: self.argv_tty(&args, opts.tty),
             cwd: None,
             env: vec![],
             path: vec![],
@@ -240,7 +266,7 @@ impl Driver for Bento {
     fn enter(&self, t: &Target) -> Result<Launch> {
         id::check(&t.id)?;
         Ok(Launch {
-            argv: self.argv(&["enter", &t.id]),
+            argv: self.argv_tty(&["enter", &t.id], true),
             cwd: None,
             env: vec![],
             path: vec![],
@@ -252,6 +278,7 @@ impl Driver for Bento {
         t: &Target,
         argv: &[String],
         stdin: Option<&[u8]>,
+        cwd: Option<&str>,
         no_start: bool,
         timeout: Option<Duration>,
     ) -> Result<Output> {
@@ -259,6 +286,7 @@ impl Driver for Bento {
             no_start,
             tty: false,
             stdin: stdin.is_some(),
+            cwd: cwd.map(String::from),
         };
         let launch = self.launch(t, argv, &opts)?;
         let (code, stdout, stderr) = run(&launch, stdin, timeout)?;
@@ -273,6 +301,7 @@ impl Driver for Bento {
         if !self.via.is_empty() {
             return Err(fail!("cp to a bento behind `via` is not supported"));
         }
+        guest_path(guest)?;
         let host = host.to_string_lossy();
         self.ok(
             &["cp", &host, &format!("{}:{ROOT}/{guest}", t.id)],
@@ -286,6 +315,7 @@ impl Driver for Bento {
         if !self.via.is_empty() {
             return Err(fail!("cp from a bento behind `via` is not supported"));
         }
+        guest_path(guest)?;
         let host = host.to_string_lossy();
         self.ok(
             &["cp", &format!("{}:{ROOT}/{guest}", t.id), &host],
@@ -307,6 +337,24 @@ impl Driver for Bento {
 
     fn local_remotes(&self) -> LocalRemotes {
         LocalRemotes::None
+    }
+}
+
+/// A path for `cp`, relative to the root: plain components only (as the host driver's).
+fn guest_path(guest: &str) -> Result<()> {
+    let ok = !guest.is_empty()
+        && Path::new(guest).components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(fail!(
+            "'{guest}': a path relative to the stew root, without '..'"
+        ))
     }
 }
 
@@ -334,6 +382,7 @@ mod tests {
                     no_start: true,
                     tty: false,
                     stdin: true,
+                    cwd: None,
                 },
             )
             .unwrap();
@@ -356,6 +405,23 @@ mod tests {
             ["bento", "enter", "port-forwarding-k3fq"]
         );
 
+        // a dir: relative to /workspace, or absolute; never '..'
+        let opts = |cwd: &str| ExecOpts {
+            cwd: Some(cwd.into()),
+            ..ExecOpts::default()
+        };
+        let w = |cwd: &str| {
+            b.launch(&t, &argv, &opts(cwd))
+                .map(|l| l.argv[2..4].to_vec())
+        };
+        assert_eq!(w("a/b").unwrap(), ["-w", "/workspace/a/b"]);
+        assert_eq!(w("/root/.claude").unwrap(), ["-w", "/root/.claude"]);
+        assert!(w("../etc").is_err() && w("").is_err());
+        for bad in ["../x", "/abs", "a/../../x", ""] {
+            assert!(b.cp_in(&t, Path::new("/tmp/f"), bad).is_err(), "{bad}");
+            assert!(b.cp_out(&t, bad, Path::new("/tmp/f")).is_err(), "{bad}");
+        }
+
         // behind ssh, everything after `via` is one shell line's words
         let b = Bento::new(Some("ssh  mac"));
         let l = b.launch(&t, &argv, &ExecOpts::default()).unwrap();
@@ -372,6 +438,16 @@ mod tests {
                 "-c",
                 "'echo '\\''a b'\\'''"
             ]
+        );
+        // and the TTY commands get a remote pty
+        assert_eq!(b.enter(&t).unwrap().argv[..3], ["ssh", "-t", "mac"]);
+        let tty = ExecOpts {
+            tty: true,
+            ..ExecOpts::default()
+        };
+        assert_eq!(
+            b.launch(&t, &argv, &tty).unwrap().argv[..3],
+            ["ssh", "-t", "mac"]
         );
         assert!(
             b.launch(

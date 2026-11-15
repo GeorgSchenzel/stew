@@ -35,9 +35,11 @@ Sites (`sites:` in config.yaml; default `desktop: {driver: bento}`, `desktop-hos
 host}`; `site:` picks the default): `{driver: bento, via: ssh mac}`, `{driver: host, root:
 ~/projects/stews}`.
 
-Units: `systemd/stew.socket` and `stew.service` (socket activation, idle exit), and
-`stew-hc.service` (the hub's hc core, always on), installed by the home-manager module
-(`homeManagerModules.default`, `services.stew.enable = true`, which also installs hc).
+Units: `stew.socket` and `stew.service` (socket activation, idle exit) and `stew-hc.service`
+(the hub's hc core, always on), from `nix/units.nix`, installed by the home-manager module
+(`homeManagerModules.default` = `.stew`, `services.stew.enable = true`, which also installs
+hc). They name store paths only (ExecStart and PATH, plus `services.stew.extraPackages`);
+`nix flake check` evaluates the module and refuses profile paths in them.
 
 Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `scan: <dir>|false`, `agent:`,
 `model:`, `runtime: hc|none`, ...),

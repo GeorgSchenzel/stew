@@ -265,7 +265,9 @@ fn client_dir() -> Option<PathBuf> {
 }
 
 /// The socket systemd passed (socket activation: `LISTEN_PID` is us, `LISTEN_FDS` ≥ 1,
-/// the first at fd 3), if any.
+/// the first at fd 3), if any. As `sd_listen_fds` does, it is made close-on-exec and the
+/// variables are unset, so no child (a host-driver command, bento) inherits the hub's
+/// socket. Call it before any thread starts.
 pub fn activated() -> Option<UnixListener> {
     use std::os::fd::FromRawFd;
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
@@ -273,9 +275,15 @@ pub fn activated() -> Option<UnixListener> {
     if pid != std::process::id() || fds < 1 {
         return None;
     }
-    // SAFETY: systemd hands fd 3 to this process as a listening socket; nothing else in
-    // the process owns it.
-    Some(unsafe { UnixListener::from_raw_fd(3) })
+    // SAFETY: single-threaded here (see above); systemd hands fd 3 to this process as a
+    // listening socket and nothing else in the process owns it.
+    unsafe {
+        for var in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
+            std::env::remove_var(var);
+        }
+        libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC);
+        Some(UnixListener::from_raw_fd(3))
+    }
 }
 
 /// Binds `socket` (replacing a stale socket file, refusing a live one), owner-only.
@@ -295,29 +303,35 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serves until killed (or idle for `idle_exit`), a thread per connection.
+/// Serves until killed (or idle for `idle_exit`), a thread per connection. With an idle
+/// exit, the accept loop itself decides it, only when no connection is waiting: one already
+/// accepted is always served (connections not yet accepted stay with systemd's socket).
 pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>) -> Result<()> {
     eprintln!("stew daemon: listening on {}", hub.socket.display());
-    if let Some(idle) = idle_exit {
-        let hub = hub.clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(1).min(idle));
-                if hub.idle_for(idle) {
-                    eprintln!("stew daemon: idle, exiting");
-                    std::process::exit(0);
-                }
-            }
-        });
+    if idle_exit.is_some() {
+        listener.set_nonblocking(true)?;
     }
-    for conn in listener.incoming() {
-        let conn = match conn {
-            Ok(c) => c,
+    loop {
+        let conn = match listener.accept() {
+            Ok((c, _)) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if idle_exit.is_some_and(|idle| hub.idle_for(idle)) {
+                    eprintln!("stew daemon: idle, exiting");
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             Err(e) => {
                 eprintln!("stew daemon: accept: {e}");
+                thread::sleep(Duration::from_millis(20));
                 continue;
             }
         };
+        if let Err(e) = conn.set_nonblocking(false) {
+            eprintln!("stew daemon: {e}");
+            continue;
+        }
         let hub = hub.clone();
         hub.active.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
@@ -328,7 +342,6 @@ pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>)
             hub.active.fetch_sub(1, Ordering::SeqCst);
         });
     }
-    Ok(())
 }
 
 fn connection(hub: &Hub, conn: UnixStream) -> std::io::Result<()> {

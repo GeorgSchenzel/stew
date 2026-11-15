@@ -29,7 +29,7 @@ pub const COMMIT: &str = include_str!("scripts/commit.sh");
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     pub dir: String,
-    /// `origin`'s URL as configured (empty: none).
+    /// Its remote's URL: origin, else its only remote (empty: none).
     pub url: String,
     /// The checked-out branch (empty: detached).
     pub branch: String,
@@ -121,7 +121,7 @@ pub fn look(
         Mode::Check => "check",
     };
     let argv = sh(INSPECT, &[mode_word, driver.local_remotes().word()]);
-    let out = driver.exec(t, &argv, None, no_start, timeout)?;
+    let out = driver.exec(t, &argv, None, None, no_start, timeout)?;
     match out.status {
         Status::NotRunning => return Ok(Looked::NotRunning),
         Status::NoBox => return Err(fail!("stew {} is not on its site", t.id)),
@@ -137,7 +137,8 @@ pub fn look(
 
 /// The snapshot's repos from what is in the root. A clone keeps its recorded name when
 /// it is the same repo in the same dir, else takes a catalog name that fits, else its dir.
-/// Detached: `origin/HEAD`'s branch. No origin: left out, with a warning.
+/// Detached: its remote's HEAD branch. No remote (none, or several and no origin): left
+/// out, with a warning.
 pub fn snapshot(
     found: &[Found],
     previous: &[RepoRecord],
@@ -148,7 +149,10 @@ pub fn snapshot(
     let mut warnings = Vec::new();
     for f in found {
         if f.url.is_empty() {
-            warnings.push(format!("{}: no origin, left out of the snapshot", f.dir));
+            warnings.push(format!(
+                "{}: no origin (and not just one remote), left out of the snapshot",
+                f.dir
+            ));
             continue;
         }
         let remote = match normalize(&f.url) {

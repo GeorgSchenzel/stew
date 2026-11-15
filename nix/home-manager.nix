@@ -1,26 +1,40 @@
-# home-manager: `services.stew.enable = true;` installs stew, its socket-activated hub
-# daemon and the hub's always-on hc core (the units in ../systemd/). The flake's
-# `homeManagerModules.default` sets the packages. (The bento side, stew's channel and the
-# in-box client and hc as tools, the skills dir, HC_SESSION and STEW_HUB in the global
-# config, comes with bento v2's module: B5.)
+# services.stew on home-manager: stew (the host CLI, the in-box client in libexec), hc, and
+# the hub's units (./units.nix): the socket-activated daemon and the always-on hc core. The
+# packages default to this flake's; the units use their store paths, never a profile.
+# (The bento side, the `stew` channel, the in-box client and hc as box tools, the skills
+# dir, HC_SESSION and STEW_HUB in bento's global config, comes with bento v2's module: B5.)
+self: systems:
 {
   config,
   lib,
+  pkgs,
   ...
 }:
 let
   cfg = config.services.stew;
+  system = pkgs.stdenv.hostPlatform.system;
+  supported = builtins.elem system systems;
 in
 {
   options.services.stew = {
-    enable = lib.mkEnableOption "stew's hub daemon, socket-activated";
+    enable = lib.mkEnableOption "stew's hub: the socket-activated daemon and the hc core";
     package = lib.mkOption {
       type = lib.types.package;
+      default = self.packages.${system}.stew;
+      defaultText = lib.literalExpression "stew.packages.\${system}.stew";
       description = "The stew package (host CLI and daemon, the in-box client in libexec).";
     };
     hcPackage = lib.mkOption {
       type = lib.types.package;
+      default = self.packages.${system}.herdr-core;
+      defaultText = lib.literalExpression "stew.packages.\${system}.herdr-core";
       description = "herdr-core (hc), the agent runtime: the hub's core and the CLI the daemon calls.";
+    };
+    extraPackages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      example = lib.literalExpression "[ inputs.bento.packages.\${system}.bento ]";
+      description = "More on the units' PATH: bento (the bento driver), and on the host driver the agents (claude, opencode) the hub's core starts in host stews.";
     };
     idleExit = lib.mkOption {
       type = lib.types.ints.positive;
@@ -30,54 +44,25 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [
+    assertions = [
+      {
+        assertion = supported;
+        message = "stew's hub is only packaged for ${lib.concatStringsSep ", " systems} (hc's release builds).";
+      }
+    ];
+
+    home.packages = lib.mkIf supported [
       cfg.package
       cfg.hcPackage
     ];
 
-    # the hub's hc core: always on, its own unit (the daemon exits when idle)
-    systemd.user.services.stew-hc = {
-      Unit = {
-        Description = "stew hub hc core (herdr-core, session stew)";
-        StartLimitIntervalSec = 0;
-      };
-      Service = {
-        ExecStart = "%h/.nix-profile/bin/herdr-core serve";
-        Environment = [
-          "HC_SESSION=stew"
-          "PATH=%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin"
-          "GIT_TERMINAL_PROMPT=0"
-        ];
-        Restart = "always";
-        RestartSec = 10;
-      };
-      Install.WantedBy = [ "default.target" ];
-    };
-
-    systemd.user.sockets.stew = {
-      Unit.Description = "stew hub socket";
-      Socket = {
-        ListenStream = "%t/stew/stew.sock";
-        SocketMode = "0600";
-        DirectoryMode = "0700";
-      };
-      Install.WantedBy = [ "sockets.target" ];
-    };
-
-    systemd.user.services.stew = {
-      Unit = {
-        Description = "stew hub daemon";
-        Requires = [ "stew.socket" ];
-        After = [ "stew.socket" ];
-      };
-      Service = {
-        # by name from the profile, never a store path
-        ExecStart = "%h/.nix-profile/bin/stew daemon --idle-exit ${toString cfg.idleExit}";
-        Environment = [
-          "PATH=%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin"
-          "GIT_TERMINAL_PROMPT=0"
-        ];
-      };
-    };
+    systemd.user = lib.mkIf supported (
+      import ./units.nix {
+        inherit lib pkgs;
+        stew = cfg.package;
+        hc = cfg.hcPackage;
+        inherit (cfg) extraPackages idleExit;
+      }
+    );
   };
 }

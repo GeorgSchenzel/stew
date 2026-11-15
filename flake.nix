@@ -13,6 +13,11 @@
         "x86_64-linux"
       ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # where the hub runs: hc ships linux builds only
+      hubSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
     in
     {
       packages = forAll (pkgs: rec {
@@ -26,14 +31,51 @@
         herdr-core = pkgs.callPackage ./nix/herdr-core.nix { };
       });
 
-      # `services.stew` (nix/home-manager.nix) with this flake's package
-      homeManagerModules.default =
-        { pkgs, lib, ... }:
+      # `services.stew` (nix/home-manager.nix): the hub on linux (hc's release builds)
+      homeManagerModules.stew = import ./nix/home-manager.nix self hubSystems;
+      homeManagerModules.default = self.homeManagerModules.stew;
+
+      # the units as they are generated: store paths only, never a profile
+      checks = nixpkgs.lib.genAttrs hubSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          # the module itself, evaluated with stand-ins for home-manager's options
+          module = nixpkgs.lib.evalModules {
+            modules = [
+              self.homeManagerModules.default
+              {
+                options = with nixpkgs.lib; {
+                  assertions = mkOption { type = types.listOf types.attrs; };
+                  home.packages = mkOption { type = types.listOf types.package; };
+                  systemd.user = mkOption { type = types.attrsOf types.anything; };
+                };
+                config.services.stew.enable = true;
+                config._module.args.pkgs = pkgs;
+              }
+            ];
+          };
+          units = module.config.systemd.user;
+          text = builtins.toJSON units;
+          plain = builtins.unsafeDiscardStringContext text;
+          has = p: nixpkgs.lib.hasInfix (builtins.unsafeDiscardStringContext p) plain;
+          bad = builtins.filter has [
+            ".nix-profile"
+            "/etc/profiles"
+            "/run/current-system"
+            "%h/"
+          ];
+        in
         {
-          imports = [ ./nix/home-manager.nix ];
-          services.stew.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.stew;
-          services.stew.hcPackage = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.herdr-core;
-        };
+          units =
+            assert nixpkgs.lib.assertMsg (bad == [ ]) "the units name a profile: ${toString bad}";
+            assert builtins.all (a: a.assertion) module.config.assertions;
+            assert builtins.length module.config.home.packages == 2;
+            assert has "${self.packages.${system}.stew}/bin/stew daemon";
+            assert has "${self.packages.${system}.herdr-core}/bin/herdr-core serve";
+            pkgs.writeText "stew-units.json" text;
+        }
+      );
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {

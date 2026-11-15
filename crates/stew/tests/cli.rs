@@ -383,3 +383,108 @@ fn socket_and_state_on_start() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(fs::read_to_string(&state).unwrap(), "{");
 }
+
+/// Socket activation: fd 3 is served, made close-on-exec and `LISTEN_*` unset (children
+/// never inherit the hub's socket); idle, it exits 0, and every accepted connection is
+/// answered until then.
+#[test]
+fn socket_activation_and_idle_exit() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let socket = env.base.join("act.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let fd = listener.as_raw_fd();
+    // the daemon's children: a `git` that records what it inherited
+    let bin = env.base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let seen = env.base.join("seen");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\n{{ env; [ -e /proc/$$/fd/3 ] && echo FD3; }} > {}\nexit 1\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    env.write(".config/stew/repos.yaml", "x: /nonexistent/x.git\n");
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        "LISTEN_PID=$$ LISTEN_FDS=1 LISTEN_FDNAMES=stew.socket exec \"$0\" daemon --idle-exit 2",
+        env!("CARGO_BIN_EXE_stew"),
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    env.envs(&mut cmd);
+    let path = std::env::var("PATH").unwrap();
+    cmd.env("PATH", format!("{}:{path}", bin.display()));
+    // SAFETY: only async-signal-safe calls between fork and exec
+    unsafe {
+        cmd.pre_exec(move || {
+            // dup2 onto itself keeps close-on-exec: clear it instead
+            let ok = if fd == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0) >= 0
+            } else {
+                libc::dup2(fd, 3) >= 0
+            };
+            if !ok {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(listener);
+    let pid = child.id();
+    let hello = || stew_proto::call(&socket, &Request::new(Call::Hello)).unwrap();
+    assert_eq!(
+        hello(),
+        Reply::Hello {
+            version: stew_proto::VERSION
+        }
+    );
+    let _ = stew_proto::call(
+        &socket,
+        &Request::new(Call::Resolve {
+            repos: vec!["x".into()],
+            base: None,
+            here: None,
+        }),
+    )
+    .unwrap();
+    let inherited = fs::read_to_string(&seen).unwrap();
+    assert!(inherited.contains("PATH="), "{inherited}");
+    assert!(!inherited.contains("LISTEN_"), "LISTEN_* left for children");
+    assert!(!inherited.contains("FD3"), "a child got the hub's socket");
+    let info = fs::read_to_string(format!("/proc/{pid}/fdinfo/3")).unwrap();
+    let flags = info
+        .lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .map(|f| u32::from_str_radix(f.trim(), 8).unwrap())
+        .unwrap();
+    assert_ne!(flags & 0o2000000, 0, "fd 3 is not close-on-exec: {info}");
+    // kept busy, it stays; every connection gets its answer
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            hello(),
+            Reply::Hello {
+                version: stew_proto::VERSION
+            }
+        );
+    }
+    // then idle: it exits 0 by itself
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(std::time::Instant::now() < deadline, "no idle exit");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(status.success());
+}

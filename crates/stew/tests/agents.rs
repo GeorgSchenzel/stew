@@ -32,6 +32,12 @@ log="$STANDIN_LOG/$(basename "$PWD")-$(basename "$0")-$$"
   echo "stew $(command -v stew)"
 } > "$log.tmp" && mv "$log.tmp" "$log"
 printf '\033]7501;state=working:app=standin\033\\'
+if [ -e "$STANDIN_LOG/commit-on-hup" ]; then
+  # an agent that still commits as it is stopped
+  here=$PWD
+  trap 'cd "$here/a" && echo late > late && git add late && git commit -qm late; exit 0' HUP TERM
+  while :; do sleep 600 & wait $!; done
+fi
 exec sleep 600
 "#;
 
@@ -822,4 +828,32 @@ fn without_the_hub_core_nothing_starts_one() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(UnixStream::connect(&socket).is_err(), "no core was started");
     t.ok(&["remove", &id]);
+}
+
+#[test]
+fn work_done_while_removing_is_not_lost() {
+    let t = setup(false);
+    fs::write(t.log.join("commit-on-hup"), "").unwrap();
+    let r = t.stew_in(
+        &["new", "a", "--title", "Late", "--brief", "-", "--start"],
+        Some(b"b"),
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let id = r.stdout.trim().to_string();
+    t.standin(&id, "claude");
+    // the first check passes; stopping the agent makes it commit; the second check sees it
+    let r = t.stew(&["remove", &id]);
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    assert!(r.stderr.contains("since the first check"), "{}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("branch main has 1 commit(s) on no remote"),
+        "{}",
+        r.stderr
+    );
+    assert!(t.stews.join(&id).join("a/late").exists(), "nothing removed");
+    assert!(t.machines().contains(&id), "connected again");
+    let r = t.ok(&["remove", "--force", &id]);
+    assert!(r.stderr.contains("lost (--force)"), "{}", r.stderr);
+    assert!(!t.stews.join(&id).exists());
 }

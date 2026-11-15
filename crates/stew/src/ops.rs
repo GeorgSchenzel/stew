@@ -26,6 +26,10 @@ use crate::{agent, id, readme, refs};
 /// How long `ls` waits for one stew before showing it unreachable.
 const LS_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the pushed check may take (it fetches every remote of every clone; a stalled
+/// connection fails sooner, inspect.sh sets low-speed limits).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// How long stopping a stew's own runtime core may take at `remove`.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -332,7 +336,14 @@ impl Hub {
                 args.extend([r.dir.clone(), r.remote.clone(), r.branch.clone()]);
             }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let out = driver.exec(&t, &inspect::sh(inspect::CLONE, &args), None, false, None)?;
+            let out = driver.exec(
+                &t,
+                &inspect::sh(inspect::CLONE, &args),
+                None,
+                None,
+                false,
+                None,
+            )?;
             if !out.ok() {
                 return Err(fail!("cloning failed: {}", out.reason()));
             }
@@ -366,7 +377,8 @@ impl Hub {
             }
             Err(e) => {
                 let mut msg = e.to_string();
-                if let Err(e2) = driver.remove(&t) {
+                // ours, just made: a broken one goes too
+                if let Err(e2) = driver.remove(&t, true) {
                     msg.push_str(&format!("; removing what was made failed too: {e2}"));
                 }
                 self.fail_creation(id, &msg);
@@ -398,39 +410,14 @@ impl Hub {
         let mut warnings = Vec::new();
         let rt = runtime::for_config(&config);
 
-        let look = match inspect::look(driver.as_ref(), &t, Mode::Check, false, None) {
-            Ok(Looked::Look(l)) => Some(l),
-            Ok(Looked::NotRunning) if force => {
-                warnings.push(format!("not verified (--force): {id} did not start"));
-                None
-            }
-            Ok(Looked::NotRunning) => {
-                return Err(Error::Refused(format!(
-                    "cannot verify that everything in {id} is pushed, nothing removed: it did not start"
-                )));
-            }
-            Err(e) if force => {
-                warnings.push(format!("not verified (--force): {e}"));
-                None
-            }
-            Err(e) => {
-                return Err(Error::Refused(format!(
-                    "cannot verify that everything in {id} is pushed, nothing removed: {e}"
-                )));
-            }
+        // a first check: a refusal here changes nothing
+        let look = verify(driver.as_ref(), &t, force, "", &mut warnings)?;
+        // its agents stop, so nothing in the runtime writes into it from here on
+        disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings);
+        let undo = |warnings: &mut Vec<String>, e: Error| -> Error {
+            connect(rt.as_ref(), id, warnings);
+            e
         };
-        if let Some(l) = &look {
-            warnings.extend(l.warnings.iter().cloned());
-            if !l.findings.is_empty() {
-                let list = l.findings.join("\n  ");
-                if !force {
-                    return Err(Error::Refused(format!(
-                        "not everything in {id} is pushed, nothing removed (--force loses it):\n  {list}"
-                    )));
-                }
-                warnings.push(format!("lost (--force):\n  {list}"));
-            }
-        }
 
         // the snapshot (and for close, the state and the LOG line), committed and pushed
         match &look {
@@ -445,7 +432,10 @@ impl Hub {
                         }
                     }
                     Err(e) => {
-                        return Err(fail!("writing the snapshot failed, nothing removed: {e}"));
+                        return Err(undo(
+                            &mut warnings,
+                            fail!("writing the snapshot failed, nothing removed: {e}"),
+                        ));
                     }
                 }
             }
@@ -453,8 +443,22 @@ impl Hub {
             None => {}
         }
         // B3: export the stew's sessions to the transcripts repo here
-        disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings);
-        driver.remove(&t)?;
+
+        // checked again right before it goes: what was done since the first check (an agent
+        // finishing as it stopped, a shell still open) is not lost silently
+        if look.is_some() {
+            let again = verify(
+                driver.as_ref(),
+                &t,
+                force,
+                " (since the first check; its agents were stopped)",
+                &mut warnings,
+            );
+            if let Err(e) = again {
+                return Err(undo(&mut warnings, e));
+            }
+        }
+        driver.remove(&t, force)?;
         self.save_state(|s| {
             s.stews.remove(id);
         })?;
@@ -558,7 +562,7 @@ impl Hub {
         let t = target(id, &placed.token);
         let mut warnings = Vec::new();
         // a stopped stew changed nothing since its last stop: nothing to snapshot
-        match inspect::look(driver.as_ref(), &t, Mode::Check, true, None) {
+        match inspect::look(driver.as_ref(), &t, Mode::Check, true, Some(CHECK_TIMEOUT)) {
             Ok(Looked::NotRunning) => {}
             Ok(Looked::Look(l)) => {
                 warnings.extend(l.warnings.iter().cloned());
@@ -622,6 +626,7 @@ impl Hub {
                     no_start,
                     tty,
                     stdin: true,
+                    cwd: None,
                 },
             )?
         };
@@ -650,10 +655,22 @@ impl Hub {
                     let config = &config;
                     let tracked = tracked.get(id);
                     let agents = agents.get(id).cloned().unwrap_or_default();
-                    s.spawn(move || self.live(config, id, p, tracked, agents))
+                    (
+                        id,
+                        p,
+                        s.spawn(move || self.live(config, id, p, tracked, agents)),
+                    )
                 })
                 .collect();
-            jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+            jobs.into_iter()
+                .map(|(id, p, j)| {
+                    // a look that panicked shows as unreachable, never as nothing
+                    j.join().unwrap_or_else(|_| {
+                        warnings.push(format!("looking at {id} failed"));
+                        from_tracked(id, tracked.get(id), &p.site, "unreachable")
+                    })
+                })
+                .collect()
         });
         stews.sort_by(|a, b| b.updated.cmp(&a.updated).then(a.id.cmp(&b.id)));
         let creations = creations
@@ -860,7 +877,8 @@ impl Hub {
                     let config = &config;
                     let p = placed.get(&t.meta.id);
                     let agents = agents.get(&t.meta.id).cloned().unwrap_or_default();
-                    s.spawn(move || match p {
+                    let site = p.map(|p| p.site.clone()).unwrap_or_default();
+                    let job = s.spawn(move || match p {
                         Some(p) => self.live(config, &t.meta.id, p, Some(t), agents),
                         None => {
                             let word = if t.meta.is_closed() {
@@ -870,10 +888,18 @@ impl Hub {
                             };
                             from_tracked(&t.meta.id, Some(t), "", word)
                         }
-                    })
+                    });
+                    (t, site, job)
                 })
                 .collect();
-            jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+            jobs.into_iter()
+                .map(|(t, site, j)| {
+                    j.join().unwrap_or_else(|_| {
+                        warnings.push(format!("looking at {} failed", t.meta.id));
+                        from_tracked(&t.meta.id, Some(t), &site, "unreachable")
+                    })
+                })
+                .collect()
         });
         Ok(Reply::Live {
             stews,
@@ -945,7 +971,7 @@ fn disconnect(rt: &dyn Runtime, driver: &dyn Driver, t: &Target, warnings: &mut 
         warnings.push(format!("disconnecting {} from the runtime: {e}", t.id));
     }
     if let Some(argv) = rt.stop_there() {
-        match driver.exec(t, &argv, None, true, Some(STOP_TIMEOUT)) {
+        match driver.exec(t, &argv, None, None, true, Some(STOP_TIMEOUT)) {
             Ok(out) if out.ok() => {}
             // stopped or gone: nothing of it runs
             Ok(out) if !matches!(out.status, driver::Status::Exited(_)) => {}
@@ -957,6 +983,58 @@ fn disconnect(rt: &dyn Runtime, driver: &dyn Driver, t: &Target, warnings: &mut 
             Err(e) => warnings.push(format!("stopping {}'s runtime core: {e}", t.id)),
         }
     }
+}
+
+/// The pushed check for `remove`: the look, or None when `force` skipped what couldn't be
+/// verified. A finding or a check that can't run refuses (unless `force`: then it is a
+/// warning of what is lost). `when` goes into the refusal.
+fn verify(
+    driver: &dyn Driver,
+    t: &Target,
+    force: bool,
+    when: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<inspect::Look>> {
+    let id = &t.id;
+    let look = match inspect::look(driver, t, Mode::Check, false, Some(CHECK_TIMEOUT)) {
+        Ok(Looked::Look(l)) => l,
+        Ok(Looked::NotRunning) if force => {
+            warnings.push(format!("not verified (--force): {id} did not start"));
+            return Ok(None);
+        }
+        Ok(Looked::NotRunning) => {
+            return Err(Error::Refused(format!(
+                "cannot verify that everything in {id} is pushed{when}, nothing removed: it did not start"
+            )));
+        }
+        Err(e) if force => {
+            warnings.push(format!("not verified (--force): {e}"));
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(Error::Refused(format!(
+                "cannot verify that everything in {id} is pushed{when}, nothing removed: {e}"
+            )));
+        }
+    };
+    for w in &look.warnings {
+        if !warnings.contains(w) {
+            warnings.push(w.clone());
+        }
+    }
+    if !look.findings.is_empty() {
+        let list = look.findings.join("\n  ");
+        if !force {
+            return Err(Error::Refused(format!(
+                "not everything in {id} is pushed{when}, nothing removed (--force loses it):\n  {list}"
+            )));
+        }
+        let lost = format!("lost (--force):\n  {list}");
+        if !warnings.contains(&lost) {
+            warnings.push(lost);
+        }
+    }
+    Ok(Some(look))
 }
 
 fn records(resolved: &[Resolved]) -> Vec<RepoRecord> {
@@ -980,7 +1058,7 @@ fn commit(
 ) -> Result<()> {
     let yaml = meta_yaml(meta);
     let argv = inspect::sh(inspect::COMMIT, &[message, line]);
-    let out = driver.exec(t, &argv, Some(yaml.as_bytes()), false, None)?;
+    let out = driver.exec(t, &argv, Some(yaml.as_bytes()), None, false, None)?;
     if out.ok() {
         Ok(())
     } else {

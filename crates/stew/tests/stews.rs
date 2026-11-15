@@ -460,14 +460,41 @@ fn the_pushed_check_refuses_what_it_would_lose() {
         ("submodule commit", format!("cd a && git -c protocol.file.allow=always submodule add -q {} sub && git commit -qm sub && git push -q && cd sub && echo s > s && git add s && git commit -qm s && cd .. && git add sub && git commit -qm bump && git push -q", remote_a.display()), "a/sub: branch main has 1 commit(s) on no remote"),
         ("submodule dirty", format!("cd a && git -c protocol.file.allow=always submodule add -q {} sub2 && git commit -qm sub && git push -q && echo s > sub2/new", remote_a.display()), "a/sub2: uncommitted"),
         ("notes gone", "rm -rf notes".into(), "notes: missing"),
+        // the check's own fetch must not rewrite or prune what it checks
+        ("prune tags by config", "cd a && git config fetch.prune true && git config fetch.pruneTags true && echo c > c && git add c && git commit -qm c && git tag v2 && git reset -q --hard HEAD~1".into(), "tag v2 is on no remote"),
+        ("prune by the remote's config", "cd a && git config remote.origin.prune true && git config remote.origin.pruneTags true && git tag v2".into(), "tag v2 is on no remote"),
+        ("a forced refspec into a branch", "cd a && git push -q origin main:other && git switch -qc other && echo c > c && git add c && git commit -qm wip && git switch -q main && git config --add remote.origin.fetch '+refs/heads/other:refs/heads/other'".into(), "branch other has 1 commit(s) on no remote"),
+        ("a mirror refspec", "cd a && git switch -qc side && echo c > c && git add c && git commit -qm c && git switch -q main && git config remote.origin.fetch '+refs/*:refs/*'".into(), "branch side has 1"),
+        ("a forced tag refspec", "cd a && git push -q origin main:refs/tags/v3 && echo c > c && git add c && git commit -qm c && git tag v3 && git reset -q --hard HEAD~1 && git config --add remote.origin.fetch '+refs/tags/*:refs/tags/*' && git config remote.origin.tagOpt --tags".into(), "tag v3 is on no remote"),
+        ("a deinit'd submodule", format!("cd a && git -c protocol.file.allow=always submodule add -q {} sub3 && git commit -qm sub && git push -q && cd sub3 && echo s > s && git add s && git commit -qm s && cd .. && git add sub3 && git commit -qm bump && git push -q && git submodule -q deinit -f sub3", remote_a.display()), "a (module sub3): branch main has 1 commit(s) on no remote"),
+        ("a worktree whose dir is gone", format!("git -C a worktree add -q --detach {o}/wt-g && cd {o}/wt-g && echo c > c && git add c && git commit -qm c && cd / && rm -rf {o}/wt-g", o = outside.display()), "(its dir is gone): a detached HEAD has 1"),
+        ("an ignored nested repo", "printf 'third/\\n' >> a/.git/info/exclude && mkdir -p a/third && git init -q a/third/x && cd a/third/x && echo c > c && git add c && git commit -qm c".into(), "a/third/x: branch main has 1 commit(s) and no remote"),
+        ("a rebase in a worktree elsewhere", format!("git -C a worktree add -q {o}/wt-r -b wr && cd {o}/wt-r && echo 1 > f && git add f && git commit -qm f && git push -q origin wr && GIT_SEQUENCE_EDITOR='sed -i s/^pick/edit/' git rebase -q -i HEAD~1", o = outside.display()), "in progress (rebase-merge)"),
         ("hooks are not run", format!("cd a && printf '#!/bin/sh\\ntouch {o}/hook-ran\\n' > .git/hooks/reference-transaction && chmod +x .git/hooks/reference-transaction && git config core.fsmonitor 'touch {o}/fsmonitor-ran; false' && echo c > c", o = outside.display()), "?? c"),
     ];
+    // every ref of every repo the check looks at, and whether a FETCH_HEAD appeared
+    let refs = |root: &Path| -> String {
+        let mut all = String::new();
+        for repo in ["a", "notes", "a/third/x"] {
+            let dir = root.join(repo);
+            if dir.join(".git").exists() {
+                all.push_str(&t.git(&dir, &["for-each-ref"]));
+                all.push_str(&format!(
+                    "\nFETCH_HEAD {}\n",
+                    dir.join(".git/FETCH_HEAD").exists()
+                ));
+            }
+        }
+        all
+    };
     for (name, script, expect) in &cases {
         let id = t.create(&["a", "--title", name]);
         let root = t.root(&id);
         t.sh(&root, script);
+        let before = refs(&root);
         let r = t.stew(&["remove", &id]);
         assert_eq!(r.code, 2, "{name}: remove must refuse\n{}", r.stderr);
+        assert_eq!(refs(&root), before, "{name}: the check changed refs");
         assert!(
             r.stderr.contains(expect),
             "{name}: wanted {expect:?} in\n{}",
@@ -517,6 +544,10 @@ fn the_pushed_check_passes_what_is_safe() {
         ("an empty dir", "mkdir scratch".into()),
         ("a reference repo with nothing of its own", format!("git clone -q {} ref", t.env.base.join("remotes/b.git").display())),
         ("remote tags", "cd a && git tag t1 && git push -q origin t1".into()),
+        ("only an upstream remote", "git -C a remote rename origin upstream".into()),
+        ("an ignored nested clone of a pushed repo", format!("printf 'deps/\\n' >> a/.git/info/exclude && mkdir a/deps && git clone -q {} a/deps/b", t.env.base.join("remotes/b.git").display())),
+        ("a deinit'd submodule with all pushed", format!("cd a && git -c protocol.file.allow=always submodule add -q {} sub && git commit -qm sub && git push -q && git submodule -q deinit -f sub", t.env.base.join("remotes/a.git").display())),
+        ("pruning config", "cd a && git config fetch.prune true && git config fetch.pruneTags true && git config --add remote.origin.fetch '+refs/*:refs/*'".into()),
         ("a pruned worktree", format!("git -C a worktree add -q {}/wt-gone -b wg && git -C a push -q origin wg && rm -rf {}/wt-gone", outside.display(), outside.display())),
     ];
     fs::write(outside.join("keep"), "x").unwrap();
@@ -529,6 +560,11 @@ fn the_pushed_check_passes_what_is_safe() {
         let r = t.stew(&["remove", &id]);
         assert_eq!(r.code, 0, "{name}: remove must pass\n{}", r.stderr);
         assert!(!root.exists(), "{name}");
+        let meta = yaml(&t.tracked_file(&id, "stew.yaml"));
+        assert_eq!(
+            meta["repos"][0]["name"], "a",
+            "{name}: the snapshot keeps the repo"
+        );
         assert!(
             outside.join("keep").exists(),
             "{name}: removed outside the root"
@@ -605,4 +641,43 @@ fn the_daemon_exits_when_idle() {
         assert!(Instant::now() < deadline, "still running");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// In a box nothing local survives, and neither does a git server in the box itself.
+#[test]
+fn remotes_on_the_box_itself_die_with_it() {
+    let env = Env::new();
+    let root = env.base.join("root");
+    fs::create_dir_all(root.join("r")).unwrap();
+    env.git(&root.join("r"), &["init", "-q"]);
+    fs::write(root.join("r/f"), "x").unwrap();
+    env.git(&root.join("r"), &["add", "f"]);
+    env.git(&root.join("r"), &["commit", "-qm", "f"]);
+    for (name, url) in [
+        ("lo", "http://127.0.0.1:9/x.git"),
+        ("name", "ssh://git@localhost/x.git"),
+        ("v6", "http://[::1]:9/x.git"),
+        ("scp", "git@localhost:x.git"),
+        ("far", "https://example.invalid/x.git"),
+    ] {
+        env.git(&root.join("r"), &["remote", "add", name, url]);
+    }
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", stew::inspect::INSPECT, "stew", "check", "none"])
+        .current_dir(&root);
+    env.envs(&mut cmd);
+    let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
+    for name in ["lo", "name", "v6", "scp"] {
+        assert!(
+            out.contains(&format!("W r: remote {name} ("))
+                && out.contains("is removed with the stew"),
+            "{name}: {out}"
+        );
+    }
+    assert!(!out.contains("remote far ("), "{out}");
+    assert!(out.contains("W r: cannot fetch far"), "{out}");
+    assert!(
+        out.contains("branch main has 1 commit(s) and no remote"),
+        "{out}"
+    );
 }

@@ -18,9 +18,12 @@ if [ -n "$line" ]; then
 	printf '%s\n' "$line" >>LOG.md
 	set -- stew.yaml LOG.md
 fi
-if ! g config user.email >/dev/null || ! g config user.name >/dev/null; then
-	export GIT_AUTHOR_NAME=stew GIT_AUTHOR_EMAIL=stew@localhost
-	export GIT_COMMITTER_NAME=stew GIT_COMMITTER_EMAIL=stew@localhost
+# only the half of the identity git lacks
+if ! g config user.name >/dev/null; then
+	export GIT_AUTHOR_NAME=stew GIT_COMMITTER_NAME=stew
+fi
+if ! g config user.email >/dev/null; then
+	export GIT_AUTHOR_EMAIL=stew@localhost GIT_COMMITTER_EMAIL=stew@localhost
 fi
 # `add` first: a LOG.md the agent deleted is new again
 g add -- "$@"

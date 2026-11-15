@@ -125,7 +125,7 @@ impl Driver for Host {
         )])
     }
 
-    fn remove(&self, t: &Target) -> Result<()> {
+    fn remove(&self, t: &Target, _force: bool) -> Result<()> {
         if let Some(root) = self.existing_root(t)? {
             fs::remove_dir_all(&root)
                 .map_err(|e| fail!("cannot remove {}: {e}", root.display()))?;
@@ -140,16 +140,23 @@ impl Driver for Host {
         })
     }
 
-    fn launch(&self, t: &Target, argv: &[String], _opts: &ExecOpts) -> Result<Launch> {
+    fn launch(&self, t: &Target, argv: &[String], opts: &ExecOpts) -> Result<Launch> {
         let root = self
             .existing_root(t)?
             .ok_or_else(|| fail!("stew {} has no dir on this site", t.id))?;
         if argv.is_empty() {
             return Err(fail!("no command"));
         }
+        let cwd = match &opts.cwd {
+            None => root,
+            Some(c) => {
+                super::check_cwd(c)?;
+                root.join(c)
+            }
+        };
         Ok(Launch {
             argv: argv.to_vec(),
-            cwd: Some(root),
+            cwd: Some(cwd),
             env: self.env(t),
             path: self.path(),
         })
@@ -166,6 +173,7 @@ impl Driver for Host {
         t: &Target,
         argv: &[String],
         stdin: Option<&[u8]>,
+        cwd: Option<&str>,
         _no_start: bool,
         timeout: Option<Duration>,
     ) -> Result<Output> {
@@ -176,7 +184,11 @@ impl Driver for Host {
                 stderr: vec![],
             });
         }
-        let launch = self.launch(t, argv, &ExecOpts::default())?;
+        let opts = ExecOpts {
+            cwd: cwd.map(String::from),
+            ..ExecOpts::default()
+        };
+        let launch = self.launch(t, argv, &opts)?;
         let (code, stdout, stderr) = run(&launch, stdin, timeout)?;
         Ok(Output {
             status: Status::Exited(code),
@@ -228,7 +240,7 @@ mod tests {
         let t = target("a-k3fq");
         assert_eq!(h.state(&t).unwrap(), BoxState::Missing);
         assert_eq!(
-            h.exec(&t, &["true".into()], None, false, None)
+            h.exec(&t, &["true".into()], None, None, false, None)
                 .unwrap()
                 .status,
             Status::NoBox
@@ -244,6 +256,7 @@ mod tests {
                 &t,
                 &sh("pwd; echo $STEW_TOKEN $STEW_HUB $HC_SESSION; echo \"${PATH%%:*}\"; cat"),
                 Some(b"in"),
+                None,
                 true,
                 None,
             )
@@ -257,6 +270,14 @@ mod tests {
             )
         );
 
+        // a dir relative to the root, or absolute; never '..'
+        fs::create_dir(tmp.path().join("stews/a-k3fq/sub")).unwrap();
+        let pwd = |cwd| h.exec(&t, &["pwd".into()], None, Some(cwd), false, None);
+        assert_eq!(pwd("sub").unwrap().stdout(), format!("{root}/sub\n"));
+        let abs = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(pwd(&abs).unwrap().stdout(), format!("{abs}\n"));
+        assert!(pwd("../x").is_err() && pwd("sub/../..").is_err() && pwd("").is_err());
+
         fs::write(tmp.path().join("f"), "x").unwrap();
         h.cp_in(&t, &tmp.path().join("f"), "g").unwrap();
         h.cp_out(&t, "g", &tmp.path().join("back")).unwrap();
@@ -266,9 +287,9 @@ mod tests {
         assert!(h.ports(&t).unwrap().is_empty());
 
         assert!(!h.stop(&t).unwrap().is_empty(), "says it stops nothing");
-        h.remove(&t).unwrap();
+        h.remove(&t, false).unwrap();
         assert_eq!(h.state(&t).unwrap(), BoxState::Missing);
-        h.remove(&t).unwrap();
+        h.remove(&t, true).unwrap();
     }
 
     #[test]
@@ -282,7 +303,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("precious"), "x").unwrap();
         std::os::unix::fs::symlink(&outside, tmp.path().join("l-0000")).unwrap();
-        assert!(h.remove(&target("l-0000")).is_err());
+        assert!(h.remove(&target("l-0000"), true).is_err());
         assert!(outside.join("precious").exists());
     }
 }
