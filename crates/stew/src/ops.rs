@@ -1197,8 +1197,9 @@ fn disconnect(
     if let Some(argv) = rt.stop_there() {
         match driver.exec(t, &argv, None, None, true, Some(STOP_TIMEOUT)) {
             Ok(out) if out.ok() => {}
-            // stopped or gone: nothing of it runs
+            // stopped or gone, or no hc there (127): nothing of it runs
             Ok(out) if !matches!(out.status, driver::Status::Exited(_)) => {}
+            Ok(out) if out.status == driver::Status::Exited(127) => {}
             Ok(out) => {
                 return Err(fail!(
                     "stopping {}'s runtime core failed: {}",

@@ -5,8 +5,8 @@
 # profile, so what host stews' agents may run is `agentPackages` (and `extraPackages`).
 # `hostSkills.enable` (off by default) links the stew skill and hc's stub, from the package,
 # into the host's claude and opencode skills dirs.
-# With bento's module (`programs.bento`) enabled, `bento.enable` adds stew's parts to bento's
-# global config: the `stew` channel to the stews' socket, the in-box client and hc as box
+# With bento's module (`programs.bento`) imported, `bento.enable` (off by default) adds
+# stew's parts to bento's global config: the `stew` channel to the stews' socket, the in-box client and hc as box
 # tools (pinned to this flake's rev), the skills dir in both agents' skills dirs, and
 # `STEW_HUB`. No `HC_SESSION`: every hc, in boxes and at the hub, uses hc's default session.
 self: systems:
@@ -88,15 +88,10 @@ in
       `~/.claude/skills/` and `~/.config/opencode/skills/` from the stew package
       (`share/stew/skills`), store paths only. Independent of `enable`'';
     bento = {
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        default = config.programs.bento.enable or false;
-        defaultText = lib.literalExpression "config.programs.bento.enable";
-        description = ''
-          stew's parts of bento's global config (`programs.bento.settings`): the `stew`
-          channel, the in-box client and hc as tools, the skills dir, `STEW_HUB`.
-        '';
-      };
+      enable = lib.mkEnableOption ''
+        stew's parts of bento's global config (`programs.bento.settings`): the `stew` channel,
+        the in-box client and hc as tools, the skills dir, `STEW_HUB`. Off by default: bento's
+        builder must be able to fetch `flake` (a tool it can't build fails every box's boot)'';
       flake = lib.mkOption {
         type = lib.types.str;
         default = "github:GeorgSchenzel/stew/${self.rev or "master"}";

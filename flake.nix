@@ -74,6 +74,7 @@
                     };
                   };
                   config.services.stew.enable = true;
+                  config.services.stew.bento.enable = lib.mkDefault true;
                   config.programs.bento = {
                     enable = true;
                     package = stand-in-bento;

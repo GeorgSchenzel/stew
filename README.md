@@ -52,8 +52,8 @@ hc). They name store paths only: ExecStart, and PATH from stew's own tools plus
 `services.stew.agentPackages` (what host stews' agents get: claude, opencode, nix and the usual
 command-line tools, by default) and `extraPackages` (bento's package when `programs.bento` is
 enabled; a git helper the git config names without a path). `nix flake check` evaluates the
-module and refuses profile paths in them. With bento's module enabled, `services.stew.bento`
-(on by default then) adds stew's parts to `programs.bento.settings`: the `stew` channel to
+module and refuses profile paths in them. With bento's module imported, `services.stew.bento.enable`
+(off by default: bento's builder must be able to fetch the flake) adds stew's parts to `programs.bento.settings`: the `stew` channel to
 `%t/stew/box.sock` (`bento.hubSocket`, default `/run/user/1000/stew/box.sock`), the tools
 `stew` (`#stew-box`) and `hc` (`#herdr-core`) from `bento.flake` (this flake at its rev), the
 skills dir at `~/.claude/skills` and `~/.config/opencode/skills`, and `STEW_HUB`.
