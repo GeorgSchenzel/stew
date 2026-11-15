@@ -1023,6 +1023,36 @@ fn a_pushed_from_takes_over_no_stew() {
     let c = r.stdout.trim().to_string();
     let r = t.inside(&a, &["agent", &c, "go"], None);
     assert_eq!(r.code, 0, "{}", r.stderr);
+
+    // b closed, `from: a` pushed onto its branch, then `stew open b`: still not a's, since
+    // open takes `from` from the claim commit
+    t.ok(&["close", "--force", &b]);
+    t.env.git(&work, &["fetch", "-q", "origin", &branch]);
+    t.env.git(&work, &["reset", "-q", "--hard", "FETCH_HEAD"]);
+    let yaml = fs::read_to_string(work.join("stew.yaml")).unwrap();
+    assert!(yaml.contains("state: closed"), "{yaml}");
+    let yaml: String = yaml
+        .lines()
+        .filter(|l| !l.starts_with("from:"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(work.join("stew.yaml"), format!("{yaml}from: {a}\n")).unwrap();
+    t.env.git(
+        &work,
+        &["commit", "-qa", "--allow-empty", "-m", "spoof while closed"],
+    );
+    t.env
+        .git(&work, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
+    let r = t.ok(&["open", &b]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let r = t.inside(&a, &["agent", &b, "go"], None);
+    assert_eq!(r.code, 2, "a reopened b: {}", r.stderr);
+    assert!(r.stderr.contains("was not started from"), "{}", r.stderr);
+    let reopened = t.env.git(
+        &t.notes,
+        &["show", &format!("refs/heads/{branch}:stew.yaml")],
+    );
+    assert!(!reopened.contains(&format!("from: {a}")), "{reopened}");
     for id in [&a, &b, &c] {
         t.ok(&["remove", "--force", id]);
     }

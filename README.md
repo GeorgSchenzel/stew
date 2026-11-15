@@ -50,6 +50,11 @@ command-line tools, by default) and `extraPackages` (bento's package when `progr
 enabled; a git helper the git config names without a path). `nix flake check` evaluates the
 module and refuses profile paths in them.
 
+claude-code is unfree, and it is in the default `agentPackages`: `services.stew.enable`
+fails evaluation unless your pkgs allow it (`nixpkgs.config.allowUnfree = true`, or an
+`allowUnfreePredicate` that accepts `claude-code`). Without unfree, set `agentPackages`
+yourself and leave it out.
+
 Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `scan: <dir>|false`, `agent:`,
 `model:`, `runtime: hc|none`, ...),
 the catalog in `~/.config/stew/repos.yaml` (nested groups; a string is a remote).

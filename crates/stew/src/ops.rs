@@ -258,9 +258,17 @@ impl Hub {
             .ok_or_else(|| fail!("no tracked stew {id}"))?;
         let (resolved, more) = refs::resolve_open(&meta.repos)?;
         warnings.extend(more);
+        // the branch is box-writable: `from` (what lets a stew start agents here) is the
+        // claim commit's, never what was pushed onto the branch while it was closed
+        let from = {
+            let mirror = self.mirror(&config)?;
+            let _lock = self.mirror_lock();
+            mirror.claimed_from(id)?
+        };
         let reopen = meta.is_closed().then(|| StewMeta {
             state: Some(Openness::Open),
             closed: None,
+            from: from.clone(),
             ..meta.clone()
         });
         let token = id::token()?;
@@ -276,7 +284,7 @@ impl Hub {
             None,
             &mut warnings,
             reopen,
-            meta.from.as_deref(),
+            from.as_deref(),
         )?;
         Ok(Reply::Created {
             id: id.to_string(),

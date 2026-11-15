@@ -170,6 +170,27 @@ impl Mirror {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// The `from` in the claim commit (the branch's only root) of `stew/<id>`: fixed when
+    /// the daemon claimed the id, so a later push onto the branch doesn't change it. `None`
+    /// when the branch has no single root whose `stew.yaml` names this id.
+    pub fn claimed_from(&self, id: &str) -> Result<Option<String>> {
+        let roots = git(
+            &self.dir,
+            ["rev-list", "--max-parents=0", &branch(id), "--"],
+        )?;
+        let mut roots = roots.lines();
+        let (Some(root), None) = (roots.next(), roots.next()) else {
+            return Ok(None);
+        };
+        let Ok(text) = git(&self.dir, ["show", &format!("{root}:stew.yaml")]) else {
+            return Ok(None);
+        };
+        Ok(parse_meta(&text)
+            .ok()
+            .filter(|m| m.id == id)
+            .and_then(|m| m.from))
+    }
+
     /// Tracked stews, most recent first: the open ones, or with `closed` the closed
     /// ones. With `search`, those of either kind whose id, title or any notes file
     /// contains it (case-insensitive). Unreadable `stew.yaml` files are skipped with a
