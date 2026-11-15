@@ -17,4 +17,5 @@ pub mod refs;
 pub mod runtime;
 pub mod skills;
 pub mod state;
+pub mod transcripts;
 pub mod url;

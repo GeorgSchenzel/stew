@@ -73,6 +73,10 @@
             assert builtins.length module.config.home.packages == 2;
             assert has "${self.packages.${system}.stew}/bin/stew daemon";
             assert has "${self.packages.${system}.herdr-core}/bin/herdr-core serve";
+            assert has "${self.packages.${system}.stew}/bin/stew export --all";
+            assert has "${self.packages.${system}.stew}/bin/stew skills";
+            assert units.timers.stew-hourly.Timer.OnCalendar == "hourly";
+            assert units.timers.stew-hourly.Install.WantedBy == [ "timers.target" ];
             pkgs.writeText "stew-units.json" text;
         }
       );

@@ -90,7 +90,18 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Snapshot a stew, warn about unpushed work, stop it
+    /// Export running stews' agent sessions to the transcripts repo (commits daily)
+    Export {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        /// Every running stew (the hourly timer)
+        #[arg(long)]
+        all: bool,
+        /// Commit and push now
+        #[arg(long)]
+        push: bool,
+    },
+    /// Snapshot a stew, export its sessions, warn about unpushed work, stop it
     Stop { id: String },
     /// A shell where the stew lives
     Enter { id: String },
@@ -226,6 +237,16 @@ fn run(cli: Cli) -> Result<u8> {
         Cmd::Remove { id, force } => done(call(&paths, Call::Remove { id, force })?),
         Cmd::Close { id, force } => done(call(&paths, Call::Close { id, force })?),
         Cmd::Start { id, .. } => done(call(&paths, Call::Start { id })?),
+        Cmd::Export { id, push, .. } => match call(&paths, Call::Export { id, push })? {
+            Reply::Exported { lines, warnings } => {
+                warn(&warnings);
+                for l in lines {
+                    println!("{l}");
+                }
+                Ok(0)
+            }
+            _ => Err(Error::Fail("unexpected reply from the daemon".into())),
+        },
         Cmd::Stop { id } => done(call(&paths, Call::Stop { id })?),
         Cmd::Title { id, title } => done(call(&paths, Call::Title { id, title })?),
         Cmd::Enter { id } => launch(

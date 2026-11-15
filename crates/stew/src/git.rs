@@ -1,6 +1,6 @@
 //! Git on the hub, hook-free: no hooks, no fsmonitor, never a prompt (a credential problem
 //! fails instead of hanging the daemon). The hub's own repos only (the artifacts mirror,
-//! later transcripts) and `ls-remote`; git in clones runs in the box.
+//! the transcripts) and `ls-remote`; git in clones runs in the box.
 
 use std::ffi::OsStr;
 use std::io::Write;

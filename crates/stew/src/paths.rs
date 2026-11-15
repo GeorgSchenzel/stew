@@ -13,7 +13,7 @@ pub struct Paths {
     pub config: PathBuf,
     /// `~/.local/state/stew`: the daemon's state file.
     pub state: PathBuf,
-    /// `~/.local/share/stew`: the artifacts mirror.
+    /// `~/.local/share/stew`: the artifacts mirror, the transcripts, the skills dir.
     pub data: PathBuf,
     /// `$XDG_RUNTIME_DIR/stew`: the socket.
     pub runtime: PathBuf,
@@ -79,6 +79,11 @@ impl Paths {
 
     pub fn mirror(&self) -> PathBuf {
         self.data.join("artifacts.git")
+    }
+
+    /// The hub's checkout of the transcripts repo (never cloned into a stew).
+    pub fn transcripts(&self) -> PathBuf {
+        self.data.join("transcripts")
     }
 
     /// The skills dir boxes see (bento's global config mounts it read-only).

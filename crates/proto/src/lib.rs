@@ -17,7 +17,7 @@ pub mod show;
 pub const SKILL: &str = include_str!("../../../skills/stew/SKILL.md");
 
 /// Bumped when a request or reply changes incompatibly.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The longest request line the daemon reads (a brief travels inside one).
 pub const MAX_REQUEST: u64 = 4 << 20;
@@ -156,6 +156,14 @@ pub enum Call {
     LsFrom { id: String },
     /// Assembles the skills dir boxes see (`~/.local/share/stew/skills/`).
     Skills,
+    /// Exports the sessions of a running stew (`id: None`: every running stew) to the
+    /// transcripts repo; commits daily, or at once with `push`.
+    Export {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        push: bool,
+    },
 }
 
 impl Call {
@@ -218,6 +226,11 @@ pub enum Reply {
         driver: String,
         /// Where its root is on its site.
         root: String,
+    },
+    /// `export`: a line per stew (sessions, files written, or why it was skipped).
+    Exported {
+        lines: Vec<String>,
+        warnings: Vec<String>,
     },
     /// A command that has nothing else to say.
     Done {

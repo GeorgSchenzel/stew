@@ -21,6 +21,7 @@ use crate::inspect::{self, Look, Looked, Mode};
 use crate::mirror::{meta_yaml, parse_meta};
 use crate::runtime::{self, Runtime};
 use crate::state::{Creation, Placed, Progress};
+use crate::transcripts::{self, Exported, Transcripts};
 use crate::{agent, id, readme, refs};
 
 /// How long `ls` waits for one stew before showing it unreachable.
@@ -442,7 +443,20 @@ impl Hub {
             None if close => warnings.push(format!("{id} is not marked closed: no snapshot")),
             None => {}
         }
-        // B3: export the stew's sessions to the transcripts repo here
+        // its sessions, now that its agents are stopped (fail-closed like the check: what
+        // isn't exported is lost with it)
+        match self.export_sessions(&config, driver.as_ref(), &t, false, &mut warnings) {
+            Ok(()) => self.publish(&config, true, &mut warnings),
+            Err(e) if force => warnings.push(format!("sessions not exported (--force): {e}")),
+            Err(e) => {
+                return Err(undo(
+                    &mut warnings,
+                    Error::Refused(format!(
+                        "exporting {id}'s sessions failed, nothing removed (--force removes anyway): {e}"
+                    )),
+                ));
+            }
+        }
 
         // checked again right before it goes: what was done since the first check (an agent
         // finishing as it stopped, a shell still open) is not lost silently
@@ -572,7 +586,13 @@ impl Hub {
                         l.findings.join("\n  ")
                     ));
                 }
-                // B3: export its sessions here, before it stops
+                // its sessions, before it stops
+                if let Err(e) =
+                    self.export_sessions(&config, driver.as_ref(), &t, true, &mut warnings)
+                {
+                    warnings.push(format!("sessions not exported: {e}"));
+                }
+                self.publish(&config, true, &mut warnings);
                 if let Err(e) =
                     self.snapshot(&config, driver.as_ref(), &t, &l, false, &mut warnings)
                 {
@@ -906,6 +926,147 @@ impl Hub {
             creations: vec![],
             warnings,
         })
+    }
+}
+
+impl Hub {
+    /// The transcripts repo, if the config names one.
+    fn transcripts_repo(&self, config: &Config) -> Result<Option<Transcripts>> {
+        match &config.transcripts {
+            None => Ok(None),
+            Some(r) => Ok(Some(Transcripts::new(
+                self.paths.transcripts(),
+                crate::url::normalize(r)?,
+            ))),
+        }
+    }
+
+    /// The checkout, ready (made on first use).
+    fn transcripts_ready(
+        &self,
+        config: &Config,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<Transcripts>> {
+        let Some(tr) = self.transcripts_repo(config)? else {
+            return Ok(None);
+        };
+        let _lock = self.transcripts.lock().unwrap_or_else(|p| p.into_inner());
+        tr.ensure(warnings)?;
+        Ok(Some(tr))
+    }
+
+    /// One stew's sessions into the checkout, for `stop` and `remove`: an error when the
+    /// export failed or is incomplete. No transcripts repo configured: a warning.
+    fn export_sessions(
+        &self,
+        config: &Config,
+        driver: &dyn Driver,
+        t: &Target,
+        no_start: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(tr) = self.transcripts_ready(config, warnings)? else {
+            warnings.push(format!(
+                "no transcripts repo (`transcripts:` in {}): {}'s sessions are not exported",
+                self.paths.config_file().display(),
+                t.id
+            ));
+            return Ok(());
+        };
+        match transcripts::export(&tr, &self.transcripts, driver, t, no_start)? {
+            Exported::NotRunning => Err(fail!("{} is not running", t.id)),
+            Exported::Done(r) if r.problems.is_empty() => Ok(()),
+            Exported::Done(r) => Err(fail!("incomplete: {}", r.problems.join("; "))),
+        }
+    }
+
+    /// Commits the checkout (`now`, else daily) and pushes what the remote lacks; failures
+    /// are warnings (the commits stay, the next run pushes them).
+    fn publish(&self, config: &Config, now: bool, warnings: &mut Vec<String>) {
+        let Ok(Some(tr)) = self.transcripts_repo(config) else {
+            return;
+        };
+        let _lock = self.transcripts.lock().unwrap_or_else(|p| p.into_inner());
+        if !tr.dir.join(".git").is_dir() {
+            return;
+        }
+        if let Err(e) = tr.commit(now, &id::today()) {
+            warnings.push(format!("transcripts not committed: {e}"));
+        }
+        if let Err(e) = tr.push() {
+            warnings.push(format!(
+                "transcripts not pushed: {e} (the next export tries again)"
+            ));
+        }
+    }
+
+    /// `stew export`: the sessions of running stews (stopped ones changed nothing since
+    /// their stop: skipped, as are unreachable and busy ones), then the daily commit (or
+    /// one now with `push`) and the push.
+    pub fn export(&self, id: Option<&str>, push: bool) -> Result<Reply> {
+        let config = Config::load(&self.paths)?;
+        let mut warnings = Vec::new();
+        let Some(tr) = self.transcripts_ready(&config, &mut warnings)? else {
+            return Err(fail!(
+                "no transcripts repo: set `transcripts:` in {}",
+                self.paths.config_file().display()
+            ));
+        };
+        let ids: Vec<String> = match id {
+            Some(i) => {
+                id::check(i)?;
+                vec![i.to_string()]
+            }
+            None => self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .state
+                .stews
+                .keys()
+                .cloned()
+                .collect(),
+        };
+        let mut lines = Vec::new();
+        let mut failed = Vec::new();
+        for i in &ids {
+            let res = (|| -> Result<String> {
+                let (placed, driver) = self.placed(&config, i)?;
+                let _busy = self.busy(i)?;
+                let t = target(i, &placed.token);
+                Ok(
+                    match transcripts::export(&tr, &self.transcripts, driver.as_ref(), &t, true)? {
+                        Exported::NotRunning => format!("{i}: not running, skipped"),
+                        Exported::Done(r) => {
+                            for p in &r.problems {
+                                warnings.push(format!("{i}: {p}"));
+                            }
+                            format!(
+                                "{i}: {} session(s), {} file(s) written{}",
+                                r.sessions,
+                                r.written,
+                                if r.problems.is_empty() {
+                                    ""
+                                } else {
+                                    " (incomplete)"
+                                }
+                            )
+                        }
+                    },
+                )
+            })();
+            match res {
+                Ok(l) => lines.push(l),
+                Err(e) if id.is_some() => return Err(e),
+                Err(e) => {
+                    lines.push(format!("{i}: skipped"));
+                    failed.push(format!("{i}: {e}"));
+                }
+            }
+        }
+        warnings.extend(failed);
+        self.publish(&config, push, &mut warnings);
+        Ok(Reply::Exported { lines, warnings })
     }
 }
 

@@ -17,6 +17,11 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
 - `src/runtime.rs`: the agent runtime, hc. The hub's core (`stew-hc.service`,
   `HC_SESSION=stew`) gets each stew as a machine, via `stew exec <id> --no-start -- sh -c`;
   a host stew has its own hc session `stew-<id>`. `src/agent.rs`: the agents' command lines.
+- `src/transcripts.rs`: sessions export (`src/scripts/export.sh`, run through `exec`: claude's
+  jsonl under `~/.claude/projects/`, opencode's `session list`/`export`, only sessions under
+  the stew's root) into the hub's checkout of the transcripts repo,
+  `<id>/<agent>-<session>.json[l]` plus `.meta.json`; on `stop`, `remove` (fail-closed) and
+  hourly (`stew export --all`), committed daily or at once on `stop`/`remove`/`--push`.
 - `skills/stew/SKILL.md`: the stew skill (`stew skill` prints it; `stew skills` assembles
   `~/.local/share/stew/skills/` with hc's stub and the artifacts repo's `main:skills/`).
 
@@ -28,22 +33,24 @@ Commands: `stew new [repos…] --title t [--site s] [--branch[=name]] [--base b]
 [--start] [--agent a] [--model m]]`, `agent <id> [--agent a] [--model m] "<task>"`, `attach
 <id>/<name>`, `skills`, `skill`, `open <id>
 [--site s]`, `remove|close <id> [--force]`, `start <id>|--all`, `stop <id>`, `enter <id>`,
-`exec <id> [--no-start] [-t] -- cmd…`, `title <id> <title>`, `ls [--json]`, `ls --all
+`exec <id> [--no-start] [-t] -- cmd…`, `export <id>|--all [--push]`, `title <id> <title>`, `ls [--json]`, `ls --all
 [search] [--closed]`, `ls --waiting`, `ls --from <id>`, `daemon [--socket p] [--idle-exit s]`.
 
 Sites (`sites:` in config.yaml; default `desktop: {driver: bento}`, `desktop-host: {driver:
 host}`; `site:` picks the default): `{driver: bento, via: ssh mac}`, `{driver: host, root:
 ~/projects/stews}`.
 
-Units: `stew.socket` and `stew.service` (socket activation, idle exit) and `stew-hc.service`
-(the hub's hc core, always on), from `nix/units.nix`, installed by the home-manager module
+Units: `stew.socket` and `stew.service` (socket activation, idle exit), `stew-hc.service`
+(the hub's hc core, always on) and `stew-hourly.timer` (`stew export --all`, then `stew
+skills`), from `nix/units.nix`, installed by the home-manager module
 (`homeManagerModules.default` = `.stew`, `services.stew.enable = true`, which also installs
 hc). They name store paths only (ExecStart and PATH, plus `services.stew.extraPackages`);
 `nix flake check` evaluates the module and refuses profile paths in them.
 
-Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `scan: <dir>|false`, `agent:`,
+Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `scan: <dir>|false`, `agent:`,
 `model:`, `runtime: hc|none`, ...),
 the catalog in `~/.config/stew/repos.yaml` (nested groups; a string is a remote).
 State: `~/.local/state/stew/state.json`; the artifacts mirror:
-`~/.local/share/stew/artifacts.git`; the socket: `$XDG_RUNTIME_DIR/stew/stew.sock`
+`~/.local/share/stew/artifacts.git`; the transcripts checkout:
+`~/.local/share/stew/transcripts` (branch `main`); the socket: `$XDG_RUNTIME_DIR/stew/stew.sock`
 (`STEW_SOCKET` overrides it for clients).

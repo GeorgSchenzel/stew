@@ -1,9 +1,11 @@
 # The hub's user units, as home-manager's `systemd.user` attrsets: the socket-activated
-# daemon (`stew.socket`, `stew.service`) and the hub's always-on hc core (`stew-hc.service`).
+# daemon (`stew.socket`, `stew.service`), the hub's always-on hc core (`stew-hc.service`),
+# and the hourly timer (`stew-hourly.timer`: sessions export, the skills dir).
 # Everything comes from store paths (never a profile): ExecStart names the packages, and
-# PATH is built from them. Both units' PATH reach `stew` (hc's vias run `stew exec` by name),
-# hc, git, ssh, sh and the coreutils the scripts use, plus `extraPackages` (bento for the
-# bento driver; on the host driver, the agents the hub's core starts in host stews).
+# PATH is built from them. Every unit's PATH reaches `stew` (hc's vias run `stew exec` by
+# name), hc, git, ssh, sh and the coreutils, find, grep and sed the scripts use, plus
+# `extraPackages` (bento for the bento driver; on the host driver, the agents the hub's core
+# starts in host stews, and opencode for their sessions export).
 {
   lib,
   pkgs,
@@ -22,6 +24,8 @@ let
       pkgs.bash
       pkgs.coreutils
       pkgs.findutils
+      pkgs.gnugrep
+      pkgs.gnused
     ]
     ++ extraPackages
   );
@@ -68,5 +72,35 @@ in
       RestartSec = 10;
     };
     Install.WantedBy = [ "default.target" ];
+  };
+
+  # hourly: every running stew's sessions into the transcripts repo (committed and pushed
+  # daily; `stop` and `remove` export and push themselves), then the skills dir boxes see
+  # (the artifacts repo's `main:skills/`). Both are daemon calls (socket-activated); a
+  # failed export doesn't skip the skills (`-`).
+  services.stew-hourly = {
+    Unit = {
+      Description = "stew hourly: export sessions to the transcripts repo, assemble the skills dir";
+      Wants = [ "stew.socket" ];
+      After = [ "stew.socket" ];
+    };
+    Service = {
+      Type = "oneshot";
+      ExecStart = [
+        "-${lib.getExe stew} export --all"
+        "${lib.getExe stew} skills"
+      ];
+      Environment = env;
+    };
+  };
+
+  timers.stew-hourly = {
+    Unit.Description = "stew hourly: sessions export and skills";
+    Timer = {
+      OnCalendar = "hourly";
+      Persistent = true;
+      RandomizedDelaySec = 300;
+    };
+    Install.WantedBy = [ "timers.target" ];
   };
 }

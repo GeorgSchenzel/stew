@@ -32,6 +32,8 @@ pub struct Hub {
     pub client: Option<PathBuf>,
     /// Serializes git in the mirror (concurrent fetches fight over its lock files).
     mirror: Mutex<()>,
+    /// Guards the transcripts checkout.
+    pub transcripts: Mutex<()>,
     pub state: Mutex<StateFile>,
     /// Stews a command is working on.
     busy: Mutex<BTreeSet<String>>,
@@ -57,6 +59,7 @@ impl Hub {
             socket,
             client: client_dir(),
             mirror: Mutex::new(()),
+            transcripts: Mutex::new(()),
             state: Mutex::new(state),
             busy: Mutex::new(BTreeSet::new()),
             active: AtomicUsize::new(0),
@@ -213,6 +216,7 @@ impl Hub {
             Call::Stop { id } => self.stop(&id),
             Call::Title { id, title } => self.title(&id, &title),
             Call::Ls => self.ls(),
+            Call::Export { id, push } => self.export(id.as_deref(), push),
             Call::Where {
                 id,
                 argv,

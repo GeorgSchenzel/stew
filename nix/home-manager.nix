@@ -1,5 +1,6 @@
 # services.stew on home-manager: stew (the host CLI, the in-box client in libexec), hc, and
-# the hub's units (./units.nix): the socket-activated daemon and the always-on hc core. The
+# the hub's units (./units.nix): the socket-activated daemon, the always-on hc core, and the
+# hourly timer (sessions export to the transcripts repo, the skills dir). The
 # packages default to this flake's; the units use their store paths, never a profile.
 # (The bento side, the `stew` channel, the in-box client and hc as box tools, the skills
 # dir, HC_SESSION and STEW_HUB in bento's global config, comes with bento v2's module: B5.)
@@ -17,7 +18,7 @@ let
 in
 {
   options.services.stew = {
-    enable = lib.mkEnableOption "stew's hub: the socket-activated daemon and the hc core";
+    enable = lib.mkEnableOption "stew's hub: the socket-activated daemon, the hc core and the hourly timer";
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${system}.stew;
