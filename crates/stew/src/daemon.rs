@@ -310,6 +310,7 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
 /// Serves until killed (or idle for `idle_exit`), a thread per connection. With an idle
 /// exit, the accept loop itself decides it, only when no connection is waiting: one already
 /// accepted is always served (connections not yet accepted stay with systemd's socket).
+/// Between accepts it sleeps in `poll` (a second at most), never in a busy loop.
 pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>) -> Result<()> {
     eprintln!("stew daemon: listening on {}", hub.socket.display());
     if idle_exit.is_some() {
@@ -323,7 +324,7 @@ pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>)
                     eprintln!("stew daemon: idle, exiting");
                     return Ok(());
                 }
-                thread::sleep(Duration::from_millis(20));
+                wait_readable(&listener, Duration::from_secs(1));
                 continue;
             }
             Err(e) => {
@@ -346,6 +347,18 @@ pub fn serve(hub: Arc<Hub>, listener: UnixListener, idle_exit: Option<Duration>)
             hub.active.fetch_sub(1, Ordering::SeqCst);
         });
     }
+}
+
+/// Waits until a connection is waiting on `listener`, at most `limit` (no busy loop).
+fn wait_readable(listener: &UnixListener, limit: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, for the duration of the call
+    unsafe { libc::poll(&mut fd, 1, limit.as_millis() as libc::c_int) };
 }
 
 fn connection(hub: &Hub, conn: UnixStream) -> std::io::Result<()> {

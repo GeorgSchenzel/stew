@@ -1,7 +1,8 @@
 # services.stew on home-manager: stew (the host CLI, the in-box client in libexec), hc, and
 # the hub's units (./units.nix): the socket-activated daemon, the always-on hc core, and the
 # hourly timer (sessions export to the transcripts repo, the skills dir). The
-# packages default to this flake's; the units use their store paths, never a profile.
+# packages default to this flake's and nixpkgs'; the units use their store paths, never a
+# profile, so what host stews' agents may run is `agentPackages` (and `extraPackages`).
 # (The bento side, the `stew` channel, the in-box client and hc as box tools, the skills
 # dir, HC_SESSION and STEW_HUB in bento's global config, comes with bento v2's module: B5.)
 self: systems:
@@ -31,11 +32,51 @@ in
       defaultText = lib.literalExpression "stew.packages.\${system}.herdr-core";
       description = "herdr-core (hc), the agent runtime: the hub's core and the CLI the daemon calls.";
     };
+    agentPackages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = with pkgs; [
+        claude-code
+        opencode
+        nix
+        gawk
+        diffutils
+        patch
+        gnutar
+        gzip
+        xz
+        unzip
+        ripgrep
+        fd
+        jq
+        curl
+        less
+        which
+        file
+        procps
+        gnumake
+      ];
+      defaultText = lib.literalExpression "with pkgs; [ claude-code opencode nix gawk diffutils patch gnutar gzip xz unzip ripgrep fd jq curl less which file procps gnumake ]";
+      description = ''
+        What agents in host stews have on PATH, besides stew's own (stew, hc, git, ssh, sh,
+        coreutils, find, grep, sed): the hub's core starts them with its unit's PATH, which
+        is built from store paths, never a profile. claude and opencode (claude-code is
+        unfree), nix (a project's own tools come from its `nix develop`), and the usual
+        command-line tools. The daemon and the hourly export find opencode here too.
+        Agents in boxes get their tools from bento's config instead.
+      '';
+    };
     extraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
-      default = [ ];
-      example = lib.literalExpression "[ inputs.bento.packages.\${system}.bento ]";
-      description = "More on the units' PATH: bento (the bento driver), and on the host driver the agents (claude, opencode) the hub's core starts in host stews.";
+      default = lib.optional (config.programs.bento.enable or false) config.programs.bento.package;
+      defaultText = lib.literalExpression "lib.optional config.programs.bento.enable config.programs.bento.package";
+      example = lib.literalExpression "[ inputs.bento.packages.\${system}.bento pkgs.gh ]";
+      description = ''
+        More on the units' PATH, after `agentPackages`: bento for the bento driver (by
+        default bento's own `programs.bento.package` when that is enabled), and a git
+        helper that the git config names without a path (home-manager's `programs.git`
+        and `programs.gh` write theirs by store path; one git can't find fails the clone
+        and the pushed check, so every remove is refused).
+      '';
     };
     idleExit = lib.mkOption {
       type = lib.types.ints.positive;
@@ -62,7 +103,10 @@ in
         inherit lib pkgs;
         stew = cfg.package;
         hc = cfg.hcPackage;
-        inherit (cfg) extraPackages idleExit;
+        # the git the user's config is written for (helpers by store path)
+        git = config.programs.git.package or pkgs.git;
+        packages = cfg.agentPackages ++ cfg.extraPackages;
+        inherit (cfg) idleExit;
       }
     );
   };

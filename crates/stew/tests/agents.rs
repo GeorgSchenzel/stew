@@ -841,8 +841,10 @@ fn work_done_while_removing_is_not_lost() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     let id = r.stdout.trim().to_string();
     t.standin(&id, "claude");
-    // the first check passes; stopping the agent makes it commit; the second check sees it
-    let r = t.stew(&["remove", &id]);
+    // the first check passes; stopping the agent makes it commit; the second check sees it.
+    // `close` (remove's code with the closed marker): refused, so not marked closed, neither
+    // in the stew nor on the notes branch
+    let r = t.stew(&["close", &id]);
     assert_eq!(r.code, 2, "{}", r.stderr);
     assert!(r.stderr.contains("since the first check"), "{}", r.stderr);
     assert!(
@@ -853,7 +855,21 @@ fn work_done_while_removing_is_not_lost() {
     );
     assert!(t.stews.join(&id).join("a/late").exists(), "nothing removed");
     assert!(t.machines().contains(&id), "connected again");
-    let r = t.ok(&["remove", "--force", &id]);
+    let tracked = |path: &str| {
+        t.env
+            .git(&t.notes, &["show", &format!("refs/heads/stew/{id}:{path}")])
+    };
+    let root = t.stews.join(&id).join("notes");
+    for yaml in [
+        tracked("stew.yaml"),
+        fs::read_to_string(root.join("stew.yaml")).unwrap(),
+    ] {
+        assert!(!yaml.contains("closed"), "{yaml}");
+    }
+    assert!(!tracked("LOG.md").contains("closed"));
+    let r = t.ok(&["close", "--force", &id]);
     assert!(r.stderr.contains("lost (--force)"), "{}", r.stderr);
     assert!(!t.stews.join(&id).exists());
+    assert!(tracked("stew.yaml").contains("state: closed"));
+    assert_eq!(tracked("LOG.md").matches("closed").count(), 1);
 }

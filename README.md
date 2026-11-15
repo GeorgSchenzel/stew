@@ -44,8 +44,11 @@ Units: `stew.socket` and `stew.service` (socket activation, idle exit), `stew-hc
 (the hub's hc core, always on) and `stew-hourly.timer` (`stew export --all`, then `stew
 skills`), from `nix/units.nix`, installed by the home-manager module
 (`homeManagerModules.default` = `.stew`, `services.stew.enable = true`, which also installs
-hc). They name store paths only (ExecStart and PATH, plus `services.stew.extraPackages`);
-`nix flake check` evaluates the module and refuses profile paths in them.
+hc). They name store paths only: ExecStart, and PATH from stew's own tools plus
+`services.stew.agentPackages` (what host stews' agents get: claude, opencode, nix and the usual
+command-line tools, by default) and `extraPackages` (bento's package when `programs.bento` is
+enabled; a git helper the git config names without a path). `nix flake check` evaluates the
+module and refuses profile paths in them.
 
 Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `scan: <dir>|false`, `agent:`,
 `model:`, `runtime: hc|none`, ...),

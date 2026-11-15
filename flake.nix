@@ -35,40 +35,57 @@
       homeManagerModules.stew = import ./nix/home-manager.nix self hubSystems;
       homeManagerModules.default = self.homeManagerModules.stew;
 
-      # the units as they are generated: store paths only, never a profile
+      # the units as they are generated: store paths only, never a profile; the agents'
+      # tools and bento (bento's module enabled) on their PATH
       checks = nixpkgs.lib.genAttrs hubSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          lib = nixpkgs.lib;
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfreePredicate = p: lib.getName p == "claude-code";
+          };
+          stand-in-bento = pkgs.hello;
           # the module itself, evaluated with stand-ins for home-manager's options
-          module = nixpkgs.lib.evalModules {
+          module = lib.evalModules {
             modules = [
               self.homeManagerModules.default
               {
-                options = with nixpkgs.lib; {
+                options = with lib; {
                   assertions = mkOption { type = types.listOf types.attrs; };
                   home.packages = mkOption { type = types.listOf types.package; };
                   systemd.user = mkOption { type = types.attrsOf types.anything; };
+                  programs.bento.enable = mkOption { type = types.bool; };
+                  programs.bento.package = mkOption { type = types.package; };
                 };
                 config.services.stew.enable = true;
+                config.programs.bento = {
+                  enable = true;
+                  package = stand-in-bento;
+                };
                 config._module.args.pkgs = pkgs;
               }
             ];
           };
           units = module.config.systemd.user;
-          text = builtins.toJSON units;
-          plain = builtins.unsafeDiscardStringContext text;
-          has = p: nixpkgs.lib.hasInfix (builtins.unsafeDiscardStringContext p) plain;
+          # without string context: the check doesn't build what the units name
+          plain = builtins.unsafeDiscardStringContext (builtins.toJSON units);
+          has = p: lib.hasInfix (builtins.unsafeDiscardStringContext p) plain;
           bad = builtins.filter has [
             ".nix-profile"
             "/etc/profiles"
             "/run/current-system"
             "%h/"
           ];
+          path = builtins.unsafeDiscardStringContext (
+            lib.head (builtins.filter (lib.hasPrefix "PATH=") units.services.stew-hc.Service.Environment)
+          );
+          onPath = p: lib.hasInfix (builtins.unsafeDiscardStringContext "${p}/bin") path;
         in
         {
+          stew = self.packages.${system}.stew;
           units =
-            assert nixpkgs.lib.assertMsg (bad == [ ]) "the units name a profile: ${toString bad}";
+            assert lib.assertMsg (bad == [ ]) "the units name a profile: ${toString bad}";
             assert builtins.all (a: a.assertion) module.config.assertions;
             assert builtins.length module.config.home.packages == 2;
             assert has "${self.packages.${system}.stew}/bin/stew daemon";
@@ -77,7 +94,14 @@
             assert has "${self.packages.${system}.stew}/bin/stew skills";
             assert units.timers.stew-hourly.Timer.OnCalendar == "hourly";
             assert units.timers.stew-hourly.Install.WantedBy == [ "timers.target" ];
-            pkgs.writeText "stew-units.json" text;
+            assert lib.assertMsg (builtins.all onPath [
+              pkgs.claude-code
+              pkgs.opencode
+              pkgs.nix
+              pkgs.gnugrep
+              stand-in-bento
+            ]) "the agents' tools or bento are not on the units' PATH";
+            pkgs.writeText "stew-units.json" plain;
         }
       );
 

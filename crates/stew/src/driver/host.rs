@@ -151,7 +151,11 @@ impl Driver for Host {
             None => root,
             Some(c) => {
                 super::check_cwd(c)?;
-                root.join(c)
+                let dir = root.join(c);
+                if !dir.is_dir() {
+                    return Err(fail!("no dir {c} in stew {}", t.id));
+                }
+                dir
             }
         };
         Ok(Launch {

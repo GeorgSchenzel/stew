@@ -470,20 +470,38 @@ fn the_pushed_check_refuses_what_it_would_lose() {
         ("a worktree whose dir is gone", format!("git -C a worktree add -q --detach {o}/wt-g && cd {o}/wt-g && echo c > c && git add c && git commit -qm c && cd / && rm -rf {o}/wt-g", o = outside.display()), "(its dir is gone): a detached HEAD has 1"),
         ("an ignored nested repo", "printf 'third/\\n' >> a/.git/info/exclude && mkdir -p a/third && git init -q a/third/x && cd a/third/x && echo c > c && git add c && git commit -qm c".into(), "a/third/x: branch main has 1 commit(s) and no remote"),
         ("a rebase in a worktree elsewhere", format!("git -C a worktree add -q {o}/wt-r -b wr && cd {o}/wt-r && echo 1 > f && git add f && git commit -qm f && git push -q origin wr && GIT_SEQUENCE_EDITOR='sed -i s/^pick/edit/' git rebase -q -i HEAD~1", o = outside.display()), "in progress (rebase-merge)"),
+        ("a linked worktree's own ref", format!("git -C a worktree add -q --detach {o}/wt-k && cd {o}/wt-k && echo c > c && git add c && git commit -qm c && git update-ref refs/worktree/keep HEAD && git switch -q --detach origin/main", o = outside.display()), "wt-k): refs/worktree/keep has 1 commit(s) on no remote"),
+        ("a submodule initialised in a linked worktree", format!("cd a && git -c protocol.file.allow=always submodule add -q {r} sub4 && git commit -qm sub && git push -q && git worktree add -q --detach {o}/wt-s && cd {o}/wt-s && git -c protocol.file.allow=always submodule -q update --init sub4 && cd sub4 && git switch -qc keep && echo s > s && git add s && git commit -qm s && git switch -q --detach HEAD~1", r = remote_a.display(), o = outside.display()), "a (module worktrees/wt-s/modules/sub4): branch keep has 1 commit(s) on no remote"),
         ("hooks are not run", format!("cd a && printf '#!/bin/sh\\ntouch {o}/hook-ran\\n' > .git/hooks/reference-transaction && chmod +x .git/hooks/reference-transaction && git config core.fsmonitor 'touch {o}/fsmonitor-ran; false' && echo c > c", o = outside.display()), "?? c"),
     ];
-    // every ref of every repo the check looks at, and whether a FETCH_HEAD appeared
+    // every ref of every repo (and submodule git dir) the check looks at, and whether a
+    // FETCH_HEAD appeared
     let refs = |root: &Path| -> String {
-        let mut all = String::new();
+        let mut dirs = Vec::new();
         for repo in ["a", "notes", "a/third/x"] {
-            let dir = root.join(repo);
-            if dir.join(".git").exists() {
-                all.push_str(&t.git(&dir, &["for-each-ref"]));
-                all.push_str(&format!(
-                    "\nFETCH_HEAD {}\n",
-                    dir.join(".git/FETCH_HEAD").exists()
-                ));
+            let git = root.join(repo).join(".git");
+            if !git.is_dir() {
+                continue;
             }
+            let mut modules = vec![git.join("modules")];
+            for w in fs::read_dir(git.join("worktrees")).into_iter().flatten() {
+                modules.push(w.unwrap().path().join("modules"));
+            }
+            dirs.push(git);
+            for m in modules {
+                for d in fs::read_dir(m).into_iter().flatten() {
+                    dirs.push(d.unwrap().path());
+                }
+            }
+        }
+        let mut all = String::new();
+        for dir in dirs {
+            all.push_str(&format!("{}\n", dir.display()));
+            all.push_str(&t.git(&dir, &["for-each-ref"]));
+            all.push_str(&format!(
+                "\nFETCH_HEAD {}\n",
+                dir.join("FETCH_HEAD").exists()
+            ));
         }
         all
     };

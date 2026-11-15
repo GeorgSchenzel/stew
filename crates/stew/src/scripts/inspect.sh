@@ -93,7 +93,7 @@ survives() {
 		*) host=${host%%:*} ;;
 		esac
 		case $host in
-		localhost | localhost.* | 127.* | ::1 | 0.0.0.0 | 0:0:0:0:0:0:0:1) return 1 ;;
+		localhost | localhost.* | ip6-localhost | ip6-loopback | 127.* | ::1 | 0.0.0.0 | 0:0:0:0:0:0:0:1) return 1 ;;
 		esac
 		return 0
 	fi
@@ -115,8 +115,9 @@ drop_ns() {
 	G for-each-ref --format='delete %(refname)' "$NS/" | G update-ref --stdin
 }
 
-# Are all refs of the repo `G` reaches, and the detached HEADs in $detached, on a remote
-# that survives? F and W lines for $label; relative remote URLs start at $base.
+# Are all refs of the repo `G` reaches, the linked worktrees' own refs in $wtrefs
+# (`<sha> <ref> <where>` lines) and the detached HEADs in $detached, on a remote that
+# survives? F and W lines for $label; relative remote URLs start at $base.
 check_refs() {
 	# the refs as they are, before anything is fetched
 	refs=$(G for-each-ref --format='%(objectname) %(refname)' 2>&1) || {
@@ -158,6 +159,7 @@ EOF
 	done
 	{
 		printf '%s\n' "$refs"
+		printf '%s' "$wtrefs"
 		printf '%s' "$detached" | while IFS="$tab" read -r sha where; do
 			printf '%s DETACHED %s\n' "$sha" "$where"
 		done
@@ -187,9 +189,9 @@ EOF
 				what=$ref
 				case $ref in refs/heads/*) what="branch ${ref#refs/heads/}" ;; esac
 				if [ $counted -eq 0 ]; then
-					printf 'F %s: %s has %s commit(s) and no remote to check against\n' "$label" "$what" "$n"
+					printf 'F %s: %s has %s commit(s) and no remote to check against\n' "${rest:-$label}" "$what" "$n"
 				else
-					printf 'F %s: %s has %s commit(s) on no remote\n' "$label" "$what" "$n"
+					printf 'F %s: %s has %s commit(s) on no remote\n' "${rest:-$label}" "$what" "$n"
 				fi
 			fi
 			;;
@@ -253,6 +255,7 @@ check_module() (
 	base=$d
 	G() { g --git-dir="$d" -c core.bare=true "$@"; }
 	detached=""
+	wtrefs=""
 	if ! G symbolic-ref -q HEAD >/dev/null; then
 		h=$(G rev-parse -q --verify HEAD) && detached="$h$tab$label$nl"
 	fi
@@ -281,6 +284,7 @@ check_repo() (
 		exit 0
 	}
 	detached=""
+	wtrefs=""
 	first=1
 	w=""
 	head=""
@@ -307,6 +311,18 @@ check_repo() (
 				check_tree "$w" "$where"
 				if ! g -C "$w" symbolic-ref -q HEAD >/dev/null; then
 					h=$(g -C "$w" rev-parse -q --verify HEAD) && detached="$detached$h$tab$where$nl"
+				fi
+				# a linked worktree's own refs (refs/worktree/*): the main one's are in check_refs
+				if [ "$w" != "$top" ]; then
+					o=$(g -C "$w" for-each-ref --format='%(objectname) %(refname)' refs/worktree/ 2>&1) || {
+						findings "$where: cannot list refs" "$o"
+						o=""
+					}
+					while IFS= read -r l; do
+						[ -n "$l" ] && wtrefs="$wtrefs$l $where$nl"
+					done <<EOF
+$o
+EOF
 				fi
 			elif [ $det = 1 ] && [ -n "$head" ]; then
 				detached="$detached$head$tab$where (its dir is gone)$nl"
@@ -336,13 +352,16 @@ EOF
 	done <<EOF
 $subs
 EOF
-	# submodule git dirs nobody checks out any more
+	# submodule git dirs nobody checks out any more, and those of submodules initialised in
+	# a linked worktree (`worktrees/<wt>/modules`: checked by their refs and HEAD; their
+	# files are in that worktree's status)
 	common=$(cd "$top" && cd "$(G rev-parse --git-common-dir)" && pwd -P) || {
 		findings "$label: no common git dir" "$common"
 		exit 0
 	}
-	[ -d "$common/modules" ] || exit 0
-	find "$common/modules" -name HEAD -type f | while IFS= read -r headfile; do
+	for m in "$common/modules" "$common"/worktrees/*/modules; do
+		[ -d "$m" ] && find "$m" -name HEAD -type f
+	done | while IFS= read -r headfile; do
 		d=${headfile%/HEAD}
 		[ -d "$d/objects" ] && [ -d "$d/refs" ] || continue
 		skip=0
@@ -353,7 +372,8 @@ EOF
 $seen
 EOF
 		[ $skip = 1 ] && continue
-		check_module "$d" "$label (module ${d#"$common/modules/"})"
+		m=${d#"$common/"}
+		check_module "$d" "$label (module ${m#modules/})"
 	done
 )
 

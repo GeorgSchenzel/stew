@@ -4,14 +4,15 @@
 # Everything comes from store paths (never a profile): ExecStart names the packages, and
 # PATH is built from them. Every unit's PATH reaches `stew` (hc's vias run `stew exec` by
 # name), hc, git, ssh, sh and the coreutils, find, grep and sed the scripts use, plus
-# `extraPackages` (bento for the bento driver; on the host driver, the agents the hub's core
-# starts in host stews, and opencode for their sessions export).
+# `packages`: what the hub's core gives the agents it starts in host stews (they inherit
+# its PATH), bento for the bento driver, and whatever else the module's options add.
 {
   lib,
   pkgs,
   stew,
   hc,
-  extraPackages ? [ ],
+  git ? pkgs.git,
+  packages ? [ ],
   idleExit ? 600,
 }:
 let
@@ -19,7 +20,7 @@ let
     [
       stew
       hc
-      pkgs.git
+      git
       pkgs.openssh
       pkgs.bash
       pkgs.coreutils
@@ -27,7 +28,7 @@ let
       pkgs.gnugrep
       pkgs.gnused
     ]
-    ++ extraPackages
+    ++ packages
   );
   env = [
     "PATH=${path}"

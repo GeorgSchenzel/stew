@@ -413,14 +413,59 @@ impl Hub {
 
         // a first check: a refusal here changes nothing
         let look = verify(driver.as_ref(), &t, force, "", &mut warnings)?;
-        // its agents stop, so nothing in the runtime writes into it from here on
-        disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings);
         let undo = |warnings: &mut Vec<String>, e: Error| -> Error {
             connect(rt.as_ref(), id, warnings);
             e
         };
+        // its agents stop, so nothing in the runtime writes into it from here on
+        if let Err(e) = disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings) {
+            if !force {
+                return Err(undo(
+                    &mut warnings,
+                    Error::Refused(format!(
+                        "{e}, nothing removed (--force removes anyway; its agents may still run)"
+                    )),
+                ));
+            }
+            warnings.push(format!("{e} (--force)"));
+        }
 
-        // the snapshot (and for close, the state and the LOG line), committed and pushed
+        // its sessions, now that its agents are stopped (fail-closed like the check: what
+        // isn't exported is lost with it)
+        match self.export_sessions(&config, driver.as_ref(), &t, false, &mut warnings) {
+            Ok(()) => self.publish(&config, true, &mut warnings),
+            Err(e) if force => warnings.push(format!("sessions not exported (--force): {e}")),
+            Err(e) => {
+                return Err(undo(
+                    &mut warnings,
+                    Error::Refused(format!(
+                        "exporting {id}'s sessions failed, nothing removed (its agents were stopped; --force removes anyway): {e}"
+                    )),
+                ));
+            }
+        }
+
+        // checked again right before it goes: what was done since the first check (an agent
+        // finishing as it stopped, a shell still open) is not lost silently
+        let look = match look {
+            Some(first) => {
+                let again = verify(
+                    driver.as_ref(),
+                    &t,
+                    force,
+                    " (since the first check; its agents were stopped)",
+                    &mut warnings,
+                );
+                match again {
+                    Ok(l) => Some(l.unwrap_or(first)),
+                    Err(e) => return Err(undo(&mut warnings, e)),
+                }
+            }
+            None => None,
+        };
+
+        // the snapshot (and for close, the state and the LOG line), committed and pushed only
+        // now: a refusal above leaves the stew as it was, not marked closed
         match &look {
             Some(l) => {
                 let res = self.snapshot(&config, driver.as_ref(), &t, l, close, &mut warnings);
@@ -435,42 +480,15 @@ impl Hub {
                     Err(e) => {
                         return Err(undo(
                             &mut warnings,
-                            fail!("writing the snapshot failed, nothing removed: {e}"),
+                            fail!(
+                                "writing the snapshot failed, nothing removed (its agents were stopped): {e}"
+                            ),
                         ));
                     }
                 }
             }
             None if close => warnings.push(format!("{id} is not marked closed: no snapshot")),
             None => {}
-        }
-        // its sessions, now that its agents are stopped (fail-closed like the check: what
-        // isn't exported is lost with it)
-        match self.export_sessions(&config, driver.as_ref(), &t, false, &mut warnings) {
-            Ok(()) => self.publish(&config, true, &mut warnings),
-            Err(e) if force => warnings.push(format!("sessions not exported (--force): {e}")),
-            Err(e) => {
-                return Err(undo(
-                    &mut warnings,
-                    Error::Refused(format!(
-                        "exporting {id}'s sessions failed, nothing removed (--force removes anyway): {e}"
-                    )),
-                ));
-            }
-        }
-
-        // checked again right before it goes: what was done since the first check (an agent
-        // finishing as it stopped, a shell still open) is not lost silently
-        if look.is_some() {
-            let again = verify(
-                driver.as_ref(),
-                &t,
-                force,
-                " (since the first check; its agents were stopped)",
-                &mut warnings,
-            );
-            if let Err(e) = again {
-                return Err(undo(&mut warnings, e));
-            }
         }
         driver.remove(&t, force)?;
         self.save_state(|s| {
@@ -1126,8 +1144,14 @@ fn connect(rt: &dyn Runtime, id: &str, warnings: &mut Vec<String>) {
 
 /// Before a stew goes: forget its machine, then stop its own core where it lives (on the
 /// host it would outlive the dir, its agents with it). In that order: a machine still
-/// there would start the core again through its via. Failures are warnings.
-fn disconnect(rt: &dyn Runtime, driver: &dyn Driver, t: &Target, warnings: &mut Vec<String>) {
+/// there would start the core again through its via. A machine that can't be forgotten is
+/// a warning; a core that can't be stopped is the error (its agents may still write).
+fn disconnect(
+    rt: &dyn Runtime,
+    driver: &dyn Driver,
+    t: &Target,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     if let Err(e) = rt.disconnect(&t.id) {
         warnings.push(format!("disconnecting {} from the runtime: {e}", t.id));
     }
@@ -1136,14 +1160,17 @@ fn disconnect(rt: &dyn Runtime, driver: &dyn Driver, t: &Target, warnings: &mut 
             Ok(out) if out.ok() => {}
             // stopped or gone: nothing of it runs
             Ok(out) if !matches!(out.status, driver::Status::Exited(_)) => {}
-            Ok(out) => warnings.push(format!(
-                "stopping {}'s runtime core: {}",
-                t.id,
-                out.reason()
-            )),
-            Err(e) => warnings.push(format!("stopping {}'s runtime core: {e}", t.id)),
+            Ok(out) => {
+                return Err(fail!(
+                    "stopping {}'s runtime core failed: {}",
+                    t.id,
+                    out.reason()
+                ));
+            }
+            Err(e) => return Err(fail!("stopping {}'s runtime core failed: {e}", t.id)),
         }
     }
+    Ok(())
 }
 
 /// The pushed check for `remove`: the look, or None when `force` skipped what couldn't be
