@@ -41,6 +41,9 @@ fi
 exec sleep 600
 "#;
 
+/// The hub core's session: hc's default one.
+const HUB: &str = "default";
+
 struct Run {
     code: i32,
     stdout: String,
@@ -174,19 +177,19 @@ fn setup(slow_hc: bool) -> T {
     fs::create_dir_all(&log).unwrap();
     let socket = env.base.join("s.sock");
 
-    // the hub's core, as stew-hc.service runs it: `stew` and the agents by name on PATH
+    // the hub's core, as stew-hc.service runs it: hc's default session (in the test's own
+    // runtime and state dirs), `stew` and the agents by name on PATH
     let mut cmd = Command::new(&hc);
     cmd.arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     env.envs(&mut cmd);
-    cmd.env("HC_SESSION", "stew")
-        .env("STEW_SOCKET", &socket)
+    cmd.env("STEW_SOCKET", &socket)
         .env("STANDIN_LOG", &log)
         .env("PATH", path_with(&[&bin.join("host"), &bin.join("agents")]));
     let core = Kid(cmd.spawn().unwrap());
-    let core_socket = env.runtime().join("herdr-core/stew.sock");
+    let core_socket = env.runtime().join("herdr-core/default.sock");
     wait_for("the hub's hc core", 15, || {
         UnixStream::connect(&core_socket).is_ok()
     });
@@ -269,12 +272,31 @@ impl T {
     }
 
     fn machines(&self) -> Vec<String> {
-        self.hc_in("stew", &["machine", "ls", "--json"])["machines"]
+        self.hc_in(HUB, &["machine", "ls", "--json"])["machines"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|m| m["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// The names of the terminals in stew `id`'s herdr space (`herdr.space=stew` on its
+    /// machine), sorted.
+    fn space(&self, id: &str) -> Vec<String> {
+        let v = self.hc_in(HUB, &["ls", "--label", "herdr.space=stew", "--json"]);
+        let mut names: Vec<String> = v["terminals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| {
+                t["address"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with(&format!("{id}/")))
+            })
+            .map(|t| t["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     fn ls(&self) -> Value {
@@ -328,6 +350,10 @@ impl T {
     fn cli(&self, req: &Request) -> Reply {
         stew_proto::call(&self.socket, req).unwrap()
     }
+}
+
+fn root_of(t: &T, id: &str) -> String {
+    t.stews.join(id).to_string_lossy().into_owned()
 }
 
 fn get<'a>(log: &'a [(String, String)], key: &str) -> &'a str {
@@ -414,6 +440,36 @@ fn agents_start_stews_from_inside_one() {
         human.contains(&format!("agent {child}/claude-1  standin  working")),
         "{human}"
     );
+    assert_eq!(
+        c["agents"].as_array().unwrap().len(),
+        1,
+        "stew's shell left out"
+    );
+
+    // herdr-app's view: each stew one space (stew's shell, labelled), its agent a tab of it
+    assert_eq!(t.space(&child), ["claude-1", "stew-shell"]);
+    assert_eq!(t.space(&prepared), ["stew-shell"]);
+    assert_eq!(t.space(&parent), ["stew-shell"]);
+    let tab = |a: &str| {
+        let g = t.hc_in(HUB, &["get", a, "--json"]);
+        (
+            g["labels"]["herdr.space"].clone(),
+            g["labels"]["herdr.tab"].clone(),
+            g["keep"].clone(),
+        )
+    };
+    assert_eq!(
+        tab(&format!("{child}/claude-1")),
+        ("stew".into(), "claude-1".into(), false.into())
+    );
+    assert_eq!(
+        tab(&format!("{child}/stew-shell")),
+        ("stew".into(), "shell".into(), true.into())
+    );
+    assert_eq!(
+        t.hc_in(HUB, &["get", &format!("{child}/stew-shell"), "--json"])["cwd"],
+        root_of(&t, &child)
+    );
 
     // the brief is in the claim commit and the clone; the agent got stew's command line,
     // in the stew's root, with its token and hub, its own hc session, the in-box client
@@ -490,8 +546,24 @@ fn agents_start_stews_from_inside_one() {
         else {
             panic!("no launch")
         };
-        assert_eq!(argv, ["hc", "attach", &format!("{child}/claude-1")]);
-        assert!(env.contains(&("HC_SESSION".into(), "stew".into())));
+        assert_eq!(
+            argv,
+            [
+                "env",
+                "-u",
+                "HC_SESSION",
+                "-u",
+                "HC_SOCKET",
+                "-u",
+                "HC_TERMINAL_ID",
+                "-u",
+                "HC_TERMINAL_SOCKET",
+                "hc",
+                "attach",
+                &format!("{child}/claude-1")
+            ]
+        );
+        assert!(env.is_empty());
     }
     let r = t.stew(&["attach", "nobody-1"]);
     assert_eq!(r.code, 1, "{}", r.stderr);
@@ -535,13 +607,13 @@ fn agents_start_stews_from_inside_one() {
     );
 
     // start reconnects a machine that went missing
-    t.hc_in("stew", &["machine", "rm", &parent, "--json"]);
+    t.hc_in(HUB, &["machine", "rm", &parent, "--json"]);
     t.ok(&["start", &parent]);
     assert!(t.machines().contains(&parent));
     // one reached another way is replaced
-    t.hc_in("stew", &["machine", "rm", &parent, "--json"]);
+    t.hc_in(HUB, &["machine", "rm", &parent, "--json"]);
     t.hc_in(
-        "stew",
+        HUB,
         &[
             "machine",
             "add",
@@ -553,7 +625,9 @@ fn agents_start_stews_from_inside_one() {
         ],
     );
     t.ok(&["start", &parent]);
-    let m = t.hc_in("stew", &["machine", "ls", "--json"]);
+    // its space is there already (the stew's own core kept the shell): no second one
+    assert_eq!(t.space(&parent), ["stew-shell"]);
+    let m = t.hc_in(HUB, &["machine", "ls", "--json"]);
     let target = m["machines"]
         .as_array()
         .unwrap()
@@ -866,11 +940,8 @@ fn a_killed_client_still_gets_a_complete_stew() {
 #[test]
 fn without_the_hub_core_nothing_starts_one() {
     let t = setup(false);
-    assert_eq!(
-        t.hc_in("stew", &["server", "stop", "--json"])["stopped"],
-        true
-    );
-    let socket = t.env.runtime().join("herdr-core/stew.sock");
+    assert_eq!(t.hc_in(HUB, &["server", "stop", "--json"])["stopped"], true);
+    let socket = t.env.runtime().join("herdr-core/default.sock");
     let r = t.ok(&["ls"]);
     assert!(
         r.stderr.contains("hub's hc core is not running"),

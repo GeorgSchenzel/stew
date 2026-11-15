@@ -1,8 +1,13 @@
 //! The agent runtime: what stew itself does with agents at the hub (connect a stew, start an
-//! agent, list them with their status, attach). hc implements it now: the hub's core
-//! (`stew-hc.service`, `HC_SESSION=stew`) adds each stew as a machine reached through
-//! `stew exec <id> --no-start -- sh -c`, so a stopped stew stays stopped (hc's reconnect
-//! loop never starts one). Agents in a stew use hc themselves; stew only starts the first.
+//! agent, list them with their status, attach). hc implements it now: the hub's core is hc's
+//! default session (`stew-hc.service`, or whoever started it first: herdr-app, a plain `hc`),
+//! which adds each stew as a machine reached through `stew exec <id> --no-start -- sh -c`,
+//! so a stopped stew stays stopped (hc's reconnect loop never starts one). Agents in a stew
+//! use hc themselves; stew only starts the first.
+//!
+//! herdr-app (plan.md, herdr-app): each stew is one space on its machine. At connect stew
+//! starts a shell at the root labelled `herdr.space`/`herdr.tab` unless the space has a
+//! terminal; every agent stew starts is a tab of that space.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,8 +21,25 @@ use crate::config::{Config, RuntimeKind};
 use crate::driver::{Launch, run_command};
 use crate::error::{Result, fail};
 
-/// The hub core's session. Set on every call, never inherited.
-pub const HUB_SESSION: &str = "stew";
+/// The hub core's session: hc's default one. `HC_SESSION` is removed from every call, never
+/// inherited; this names its socket.
+const HUB_SESSION: &str = "default";
+
+/// The label values of a stew's one space and its shell's tab (ids local to the stew's
+/// machine, so every stew uses the same ones; herdr makes a space or tab of an id it doesn't
+/// know). Each agent's tab id is its name.
+pub const SPACE: &str = "stew";
+const SHELL_TAB: &str = "shell";
+/// The name of stew's own shell (left out of the agents).
+pub const SHELL: &str = "stew-shell";
+
+/// Variables that would point hc at another core or terminal than the hub's.
+const HC_VARS: [&str; 4] = [
+    "HC_SESSION",
+    "HC_SOCKET",
+    "HC_TERMINAL_ID",
+    "HC_TERMINAL_SOCKET",
+];
 
 /// How hc reaches a stew: hc appends its remote line as one argument.
 pub fn via(id: &str) -> String {
@@ -26,14 +48,15 @@ pub fn via(id: &str) -> String {
 
 pub trait Runtime: Send + Sync {
     /// Adds the stew as a machine, reached by `via`; one that is already there the same way
-    /// is kept, one reached another way is replaced.
-    fn connect(&self, id: &str, via: &str) -> Result<()>;
+    /// is kept, one reached another way is replaced. Then its space: a shell in `root`
+    /// unless the space has a terminal.
+    fn connect(&self, id: &str, via: &str, root: &str) -> Result<()>;
     /// Forgets the machine (nothing there is stopped by this).
     fn disconnect(&self, id: &str) -> Result<()>;
     /// Starts `argv` in a new terminal on the stew's machine, in `cwd`, named `<prefix>-<n>`.
     /// Returns its address, `<id>/<name>`.
     fn run(&self, id: &str, prefix: &str, argv: &[String], cwd: &str) -> Result<String>;
-    /// Live terminals on stews' machines, by machine.
+    /// Live terminals on stews' machines, by machine (stew's own shell left out).
     fn agents(&self) -> Result<BTreeMap<String, Vec<AgentInfo>>>;
     /// The command line that attaches a client's terminal to `address`.
     fn attach(&self, address: &str) -> Result<Launch>;
@@ -64,7 +87,7 @@ pub struct NoRuntime;
 const NONE: &str = "no agent runtime (`runtime: none` in stew's config.yaml)";
 
 impl Runtime for NoRuntime {
-    fn connect(&self, _: &str, _: &str) -> Result<()> {
+    fn connect(&self, _: &str, _: &str, _: &str) -> Result<()> {
         Ok(())
     }
     fn disconnect(&self, _: &str) -> Result<()> {
@@ -102,9 +125,8 @@ impl Hc {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
-        cmd.env("HC_SESSION", HUB_SESSION);
-        // the hub's core, whatever the daemon was started from
-        for var in ["HC_SOCKET", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET"] {
+        // the hub's core (the default session), whatever the daemon was started from
+        for var in HC_VARS {
             cmd.env_remove(var);
         }
         cmd
@@ -184,7 +206,7 @@ impl Hc {
     }
 }
 
-/// Where the hub's core listens, by hc's rule (docs/security.md, "State and endpoints"):
+/// Where the hub's core (the default session) listens, by hc's rule (docs/security.md, "State and endpoints"):
 /// `$XDG_RUNTIME_DIR/herdr-core/<session>.sock`, else `/run/user/<uid>/herdr-core/` when that
 /// dir exists, else the session's state dir. (A `socket` in hc's config.toml moves it; the
 /// hub's hc config must not set one.)
@@ -222,22 +244,56 @@ fn machine_of(address: &str) -> Option<&str> {
 }
 
 impl Runtime for Hc {
-    fn connect(&self, id: &str, via: &str) -> Result<()> {
-        if let Some(target) = self.machines()?.get(id) {
-            if target == via {
-                return Ok(());
+    fn connect(&self, id: &str, via: &str, root: &str) -> Result<()> {
+        let there = self.machines()?.get(id).map(|t| t == via);
+        if there != Some(true) {
+            if there.is_some() {
+                self.ok(&["machine", "rm", id, "--json"], SHORT)?;
             }
-            self.ok(&["machine", "rm", id, "--json"], SHORT)?;
+            let added = self.ok(
+                &["machine", "add", "--name", id, "--via", via, "--json"],
+                LONG,
+            )?;
+            let name = added["name"].as_str().unwrap_or("");
+            if name != id {
+                // hc renames a taken name (`id-2`); a machine under another name is no use
+                let _ = self.call(&["machine", "rm", name, "--json"], SHORT);
+                return Err(fail!("hc added {id} as '{name}'"));
+            }
         }
-        let added = self.ok(
-            &["machine", "add", "--name", id, "--via", via, "--json"],
-            LONG,
-        )?;
-        let name = added["name"].as_str().unwrap_or("");
-        if name != id {
-            // hc renames a taken name (`id-2`); a machine under another name is no use here
-            let _ = self.call(&["machine", "rm", name, "--json"], SHORT);
-            return Err(fail!("hc added {id} as '{name}'"));
+        // the stew's space: a shell, unless the space already has a terminal
+        let space = format!("herdr.space={SPACE}");
+        let v = self.ok(&["ls", "--label", &space, "--json"], SHORT)?;
+        let has = v["terminals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|t| t["address"].as_str().and_then(machine_of) == Some(id));
+        if !has {
+            let tab = format!("herdr.tab={SHELL_TAB}");
+            let args = [
+                "run",
+                "--bg",
+                "--on",
+                id,
+                "--cwd",
+                root,
+                "--name",
+                SHELL,
+                "--keep",
+                "--label",
+                &space,
+                "--label",
+                &tab,
+                "--no-parent",
+                "--json",
+            ];
+            match self.call(&args, LONG) {
+                // there since the ls (another connect): fine
+                Ok(_) => {}
+                Err(e) if e.kind == "name_taken" => {}
+                Err(e) => return Err(fail!("hc run on {id} (its shell): {}", e.message)),
+            }
         }
         Ok(())
     }
@@ -262,6 +318,9 @@ impl Runtime for Hc {
                 n += 1;
             }
             let name = format!("{prefix}-{n}");
+            // a tab of the stew's space, its id the agent's name
+            let space = format!("herdr.space={SPACE}");
+            let tab = format!("herdr.tab={name}");
             let mut args = vec![
                 "run",
                 "--bg",
@@ -271,6 +330,10 @@ impl Runtime for Hc {
                 cwd,
                 "--name",
                 &name,
+                "--label",
+                &space,
+                "--label",
+                &tab,
                 "--no-parent",
                 "--json",
                 "--",
@@ -295,6 +358,9 @@ impl Runtime for Hc {
             let Some(machine) = machine_of(address) else {
                 continue;
             };
+            if t["name"].as_str() == Some(SHELL) {
+                continue;
+            }
             let address = match t["name"].as_str() {
                 Some(name) => format!("{machine}/{name}"),
                 None => address.to_string(),
@@ -308,11 +374,18 @@ impl Runtime for Hc {
         Ok(by)
     }
 
+    /// `env -u …`: the client runs it with its own environment, whose hc variables must
+    /// not pick another core.
     fn attach(&self, address: &str) -> Result<Launch> {
+        let mut argv = vec!["env".to_string()];
+        for var in HC_VARS {
+            argv.extend(["-u".into(), var.into()]);
+        }
+        argv.extend([self.bin.clone(), "attach".into(), address.into()]);
         Ok(Launch {
-            argv: vec![self.bin.clone(), "attach".into(), address.into()],
+            argv,
             cwd: None,
-            env: vec![("HC_SESSION".into(), HUB_SESSION.into())],
+            env: vec![],
             path: vec![],
         })
     }

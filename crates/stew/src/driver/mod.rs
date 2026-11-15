@@ -135,6 +135,8 @@ pub struct Port {
     pub guest: u16,
     /// Where the host reaches it; opaque (show or dial it, never derive it).
     pub address: Option<String>,
+    /// Declared since the last boot: published at the next one (bento: `restart`).
+    pub pending: bool,
 }
 
 /// Which remotes that are local paths survive a `remove` (the pushed check counts only
@@ -158,8 +160,11 @@ pub trait Driver: Send + Sync {
     fn kind(&self) -> DriverKind;
     /// Makes the stew's place and starts it; returns its root.
     fn create(&self, t: &Target) -> Result<String>;
-    /// Starts it (bento: also applies the repos' ports live on a running box). Warnings.
+    /// Starts it; a running one stays as it is. Warnings.
     fn start(&self, t: &Target) -> Result<Vec<String>>;
+    /// Stops and starts it, so what applies only at a boot applies (bento: pending ports);
+    /// what runs in it ends. A stopped one is just started. Warnings.
+    fn restart(&self, t: &Target) -> Result<Vec<String>>;
     /// Stops it. Warnings (a driver that can't stop says so).
     fn stop(&self, t: &Target) -> Result<Vec<String>>;
     /// Takes it off the site, everything in it; `force` also when its place is broken

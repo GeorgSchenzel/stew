@@ -1,8 +1,8 @@
 //! The bento driver, written against bento's `contracts.md` (v2): a box per stew, named by
 //! the stew's id, `/workspace` as its root. Reached with `bento …`, or `<via> bento …`
 //! (e.g. `ssh mac`), whose arguments are then shell-quoted (ssh joins them into one line).
-//! Verified against the real bento in B5; until then only its command lines and parsing
-//! are tested.
+//! Unit tests cover its command lines and parsing; verified against the real bento in B5
+//! (work-stew.md).
 
 use std::path::Path;
 use std::time::Duration;
@@ -49,6 +49,8 @@ struct PortsJson {
 struct PortJson {
     guest: u16,
     address: Option<String>,
+    #[serde(default)]
+    state: String,
 }
 
 impl Bento {
@@ -155,6 +157,7 @@ pub fn parse_ports(json: &str) -> Result<Vec<Port>> {
         .map(|p| Port {
             guest: p.guest,
             address: p.address,
+            pending: p.state == "pending",
         })
         .collect())
 }
@@ -201,6 +204,12 @@ impl Driver for Bento {
     fn start(&self, t: &Target) -> Result<Vec<String>> {
         Ok(self
             .ok(&["start", &t.id, "--json"], "bento start", &t.id)?
+            .1)
+    }
+
+    fn restart(&self, t: &Target) -> Result<Vec<String>> {
+        Ok(self
+            .ok(&["restart", &t.id, "--json"], "bento restart", &t.id)?
             .1)
     }
 
@@ -479,17 +488,25 @@ mod tests {
 
         let ports = r#"{"box": "x", "running": true, "ports": [
           {"guest": 5173, "address": "127.77.0.5:5173", "state": "published"},
-          {"guest": 8080, "address": null, "state": "busy"}]}"#;
+          {"guest": 8080, "address": null, "state": "busy"},
+          {"guest": 3000, "address": null, "state": "pending"}]}"#;
         assert_eq!(
             parse_ports(ports).unwrap(),
             [
                 Port {
                     guest: 5173,
-                    address: Some("127.77.0.5:5173".into())
+                    address: Some("127.77.0.5:5173".into()),
+                    pending: false
                 },
                 Port {
                     guest: 8080,
-                    address: None
+                    address: None,
+                    pending: false
+                },
+                Port {
+                    guest: 3000,
+                    address: None,
+                    pending: true
                 }
             ]
         );

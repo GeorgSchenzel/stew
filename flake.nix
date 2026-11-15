@@ -68,6 +68,10 @@
                     systemd.user = mkOption { type = types.attrsOf types.anything; };
                     programs.bento.enable = mkOption { type = types.bool; };
                     programs.bento.package = mkOption { type = types.package; };
+                    programs.bento.settings = mkOption {
+                      type = types.attrsOf types.anything;
+                      default = { };
+                    };
                   };
                   config.services.stew.enable = true;
                   config.programs.bento = {
@@ -91,6 +95,9 @@
             "opencode/skills/${n}"
           ]) skillFiles;
           units = module.config.systemd.user;
+          # stew's parts of bento's global config
+          bento = module.config.programs.bento.settings;
+          skillsDir = "~/.local/share/stew/skills";
           # without string context: the check doesn't build what the units name
           plain = builtins.unsafeDiscardStringContext (builtins.toJSON units);
           has = p: lib.hasInfix (builtins.unsafeDiscardStringContext p) plain;
@@ -116,6 +123,24 @@
             assert has "${self.packages.${system}.stew}/bin/stew export --all";
             assert has "${self.packages.${system}.stew}/bin/stew skills";
             assert units.timers.stew-hourly.Timer.OnCalendar == "hourly";
+            # one core: hc's default session, nowhere a session of stew's own
+            assert lib.assertMsg (!lib.hasInfix "HC_SESSION" plain) "a unit sets HC_SESSION";
+            assert bento.channels.stew.socket == "/run/user/1000/stew/box.sock";
+            assert bento.env == { STEW_HUB = "unix:/run/bento/stew.sock"; };
+            assert lib.hasSuffix "#stew-box" bento.tools.stew;
+            assert lib.hasSuffix "#herdr-core" bento.tools.hc;
+            assert
+              bento.files == [
+                {
+                  guest = "~/.claude/skills";
+                  host = skillsDir;
+                }
+                {
+                  guest = "~/.config/opencode/skills";
+                  host = skillsDir;
+                }
+              ];
+            assert (eval { services.stew.bento.enable = false; }).config.programs.bento.settings == { };
             assert units.timers.stew-hourly.Install.WantedBy == [ "timers.target" ];
             assert lib.assertMsg (builtins.all onPath [
               pkgs.claude-code

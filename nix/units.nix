@@ -63,17 +63,18 @@ in
     };
   };
 
-  # the hub's hc core: always on, its own unit, so the daemon can exit when idle while the
-  # core and the agents' terminals stay up. `serve` exits 0 at once while another core of
-  # the session holds its lock: retry every 10 s, never give up.
+  # the hub's hc core, hc's default session (the one herdr-app and plain `hc` use): always
+  # on, its own unit, so the daemon can exit when idle while the core and the agents'
+  # terminals stay up. `serve` exits 0 at once while another core of the session holds its
+  # lock (herdr-app or a shell started it first): retry every 10 s, never give up.
   services.stew-hc = {
     Unit = {
-      Description = "stew hub hc core (herdr-core, session stew)";
+      Description = "stew hub hc core (herdr-core, the default session)";
       StartLimitIntervalSec = 0;
     };
     Service = {
       ExecStart = "${hc}/bin/herdr-core serve";
-      Environment = env ++ [ "HC_SESSION=stew" ];
+      Environment = env;
       Restart = "always";
       RestartSec = 10;
     };

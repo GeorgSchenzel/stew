@@ -294,7 +294,7 @@ impl Hub {
     }
 
     /// The driver's create, clones through `exec`, (reopen: the commit), the driver's
-    /// start, the runtime's connect. A failure up to the start removes the stew from the
+    /// start (a restart when the clones' ports are pending), the runtime's connect. A failure up to the start removes the stew from the
     /// site and records the creation as failed; one to connect is a warning (`stew start`
     /// connects again).
     #[allow(clippy::too_many_arguments)]
@@ -370,7 +370,21 @@ impl Hub {
                 )
                 .map_err(|e| fail!("recording the reopen failed: {e}"))?;
             }
-            driver.start(&t)
+            // the clones' ports apply only at a boot (bento): one restart, before any agent
+            let mut w = Vec::new();
+            let pending = match driver.ports(&t) {
+                Ok(ports) => ports.iter().any(|p| p.pending),
+                Err(e) => {
+                    w.push(format!("the clones' ports: {e}"));
+                    false
+                }
+            };
+            w.extend(if pending {
+                driver.restart(&t)?
+            } else {
+                driver.start(&t)?
+            });
+            Ok(w)
         })();
         match made {
             Ok(more) => {
@@ -386,7 +400,7 @@ impl Hub {
                         },
                     );
                 })?;
-                connect(rt, id, warnings);
+                connect(rt, driver, id, warnings);
                 Ok(())
             }
             Err(e) => {
@@ -427,7 +441,7 @@ impl Hub {
         // a first check: a refusal here changes nothing
         let look = verify(driver.as_ref(), &t, force, "", &mut warnings)?;
         let undo = |warnings: &mut Vec<String>, e: Error| -> Error {
-            connect(rt.as_ref(), id, warnings);
+            connect(rt.as_ref(), driver.as_ref(), id, warnings);
             e
         };
         // its agents stop, so nothing in the runtime writes into it from here on
@@ -585,7 +599,12 @@ impl Hub {
                 let (placed, driver) = self.placed(&config, i)?;
                 let _busy = self.busy(i)?;
                 let mut w = driver.start(&target(i, &placed.token))?;
-                connect(runtime::for_config(&config).as_ref(), i, &mut w);
+                connect(
+                    runtime::for_config(&config).as_ref(),
+                    driver.as_ref(),
+                    i,
+                    &mut w,
+                );
                 Ok(w)
             })();
             match res {
@@ -860,7 +879,7 @@ impl Hub {
             // concurrent agents apart), so two agents can start in one stew at once
             let _busy = self.busy(id)?;
             warnings.extend(driver.start(&t)?);
-            rt.connect(id, &runtime::via(id))?;
+            rt.connect(id, &runtime::via(id), &driver.root(&t)?)?;
         }
         let address = rt.run(id, &agent, &argv, &driver.root(&t)?)?;
         Ok(Reply::Started { address, warnings })
@@ -1148,8 +1167,14 @@ fn launch_reply(l: driver::Launch) -> Reply {
 }
 
 /// Connects a stew to the runtime; a failure is a warning (`stew start` connects again).
-fn connect(rt: &dyn Runtime, id: &str, warnings: &mut Vec<String>) {
-    if let Err(e) = rt.connect(id, &runtime::via(id)) {
+fn connect(rt: &dyn Runtime, driver: &dyn Driver, id: &str, warnings: &mut Vec<String>) {
+    let res = driver
+        .root(&Target {
+            id: id.into(),
+            env: vec![],
+        })
+        .and_then(|root| rt.connect(id, &runtime::via(id), &root));
+    if let Err(e) = res {
         warnings.push(format!(
             "{id} is not connected to the agent runtime: {e} (`stew start {id}` tries again)"
         ));

@@ -14,9 +14,11 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
   `STEW_HUB` (`unix:<socket>`) with its stew's id (from `notes/stew.yaml` walking up) and
   `STEW_TOKEN`; the daemon takes a request as that stew's only with its token, and only for
   those calls.
-- `src/runtime.rs`: the agent runtime, hc. The hub's core (`stew-hc.service`,
-  `HC_SESSION=stew`) gets each stew as a machine, via `stew exec <id> --no-start -- sh -c`;
-  a host stew has its own hc session `stew-<id>`. `src/agent.rs`: the agents' command lines.
+- `src/runtime.rs`: the agent runtime, hc. The hub's core (`stew-hc.service`, hc's default
+  session, the one herdr-app uses) gets each stew as a machine, via `stew exec <id>
+  --no-start -- sh -c`, with one herdr space: a shell `stew-shell` at the root labelled
+  `herdr.space=stew`/`herdr.tab=shell`, and each agent stew starts a tab of it (`herdr.tab=
+  <name>`); a host stew has its own hc session `stew-<id>`. `src/agent.rs`: the agents' command lines.
 - `src/transcripts.rs`: sessions export (`src/scripts/export.sh`, run through `exec`: claude's
   jsonl under `~/.claude/projects/`, opencode's `session list`/`export`, only sessions under
   the stew's root) into the hub's checkout of the transcripts repo,
@@ -50,7 +52,11 @@ hc). They name store paths only: ExecStart, and PATH from stew's own tools plus
 `services.stew.agentPackages` (what host stews' agents get: claude, opencode, nix and the usual
 command-line tools, by default) and `extraPackages` (bento's package when `programs.bento` is
 enabled; a git helper the git config names without a path). `nix flake check` evaluates the
-module and refuses profile paths in them.
+module and refuses profile paths in them. With bento's module enabled, `services.stew.bento`
+(on by default then) adds stew's parts to `programs.bento.settings`: the `stew` channel to
+`%t/stew/box.sock` (`bento.hubSocket`, default `/run/user/1000/stew/box.sock`), the tools
+`stew` (`#stew-box`) and `hc` (`#herdr-core`) from `bento.flake` (this flake at its rev), the
+skills dir at `~/.claude/skills` and `~/.config/opencode/skills`, and `STEW_HUB`.
 
 claude-code is unfree, and it is in the default `agentPackages`: `services.stew.enable`
 fails evaluation unless your pkgs allow it (`nixpkgs.config.allowUnfree = true`, or an

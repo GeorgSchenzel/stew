@@ -20,7 +20,7 @@ pub struct Host {
 }
 
 /// The hc session of a host stew's own core. A stew owns a whole machine elsewhere (a box);
-/// on the host it gets a session of its own, so the hub's core (`HC_SESSION=stew`) can add
+/// on the host it gets a session of its own, so the hub's core (hc's default session) can add
 /// it as a machine like a box, and its agents' `hc` reaches its own core.
 pub fn hc_session(id: &str) -> String {
     format!("stew-{id}")
@@ -115,6 +115,11 @@ impl Driver for Host {
             Some(_) => Ok(vec![]),
             None => Err(fail!("stew {} has no dir on this site", t.id)),
         }
+    }
+
+    /// Nothing waits for a boot here.
+    fn restart(&self, t: &Target) -> Result<Vec<String>> {
+        self.start(t)
     }
 
     fn stop(&self, t: &Target) -> Result<Vec<String>> {
