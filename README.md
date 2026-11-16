@@ -35,8 +35,8 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
 - `herdr/`: herdr-app's `stews` panel (`mods/stews`) and the `stews` layout (Herdr's main
   layout with the panel where spaces and agents were). An inbox of stews from `stew ls
   --closed --json` every 5 s: the open ones by recency, then those closed in the last two
-  weeks; each with its short id and site as faint tags, its README on the chevron, a running
-  one's agents (and their sub-agents) under it, a play button for a stopped one (`stew
+  weeks; each on two lines (the title and its short id; its state or agents' status, site
+  and age), a running one's agents (and their sub-agents) under it, a play button for a stopped one (`stew
   start`) or one on no site (`stew open`), and stop or remove on right-click.
   `services.stew.herdr.enable` links it into `~/.config/herdr-app/` (off by default); then
   `herdr-app do layout.switch '{"name":"stews"}'` once.

@@ -3,7 +3,7 @@
 // `stew open`). The list comes from `stew ls --json`; agents and their status from Herdr.
 
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView } from "gpui-base";
+import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, spaces, run, exec, theme, notify, openOverlay, closeOverlay, props, setAgentOrder, focused, shared, setShared } from "herdr";
 
 // How often the list is asked for, and how long a closed stew stays in view.
@@ -56,7 +56,6 @@ export default class Stews extends View {
     this.creations = [];
     this.problem = null;
     this.busy = {}; // id -> what stew is doing to it
-    this.open = new Set(JSON.parse(localStorage.getItem("open") ?? "[]")); // READMEs shown
     this.folded = new Set(); // agents with their sub-agents folded away
     this.all = localStorage.getItem("all") === "1";
     // what the row menu asks for comes through shared state; one from before this copy
@@ -173,7 +172,7 @@ export default class Stews extends View {
   agentRow(t, a, subs, shown) {
     const pic = icon(a.program, 15, t.foreground);
     const open = !this.folded.has(a.address);
-    return h_flex().id(`ag-${a.address}`).pl(26).pr(8).h(28).flex_none().rounded(8).items_center().gap(8)
+    return h_flex().id(`ag-${a.address}`).pl(18).pr(8).h(28).flex_none().rounded(8).items_center().gap(8)
       .when(a.focused, (el) => el.bg(t.selected))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click(() => run("pane.focus", { pane: a.pane }))
@@ -192,7 +191,7 @@ export default class Stews extends View {
     const k = s.t;
     const pic = icon(k.program, 13, t.foreground);
     const on = k.address === shown;
-    return h_flex().id(`sub-${k.address}`).pl(44).pr(8).h(25).flex_none().rounded(8).items_center().text_size(12.5)
+    return h_flex().id(`sub-${k.address}`).pl(36).pr(8).h(25).flex_none().rounded(8).items_center().text_size(12.5)
       .when(on, (el) => el.bg(t.raised))
       .hover((st) => st.bg(t.hover))
       .on_click(() => (this.listed.has(k.address) ? run("pane.focus", { terminal: k.address }) : run("terminal.peek", { terminal: k.address })))
@@ -204,51 +203,44 @@ export default class Stews extends View {
       .child(this.status(t, kidStatus(k, this.listed), true));
   }
 
-  // A small faint word after the title.
+  // A small faint word.
   tag(t, text, color) {
-    return div().flex_none().text_size(10.5).text_color(color ?? t.dim).child(text);
+    return div().flex_none().text_size(11).text_color(color ?? t.dim).child(text);
   }
 
+  // Two lines: the title with its short id on the right; under it what it's doing (its
+  // agents' most urgent status, or its state), where it is, and the play button.
   stewRow(t, s, space, mine, now) {
     const running = s.state === "running";
     const busy = this.busy[s.id];
-    const down = !running && !busy;
     const closed = s.state === "closed";
     const st = top(mine.map((a) => a.status));
-    const open = this.open.has(s.id);
     // what the play button does: a stopped stew starts, one on no site is opened there again
-    const play = s.state === "stopped" ? ["start", "starting"] : !s.site ? ["open", "opening"] : null;
-    const words = [short(s.id), s.site ?? null, running ? null : s.state].filter(Boolean);
-    const title = div().flex_1().min_w(0).truncate()
-      .text_color(running ? t.foreground : closed ? t.dim : t.muted)
-      .child(s.title || s.id);
-    return h_flex().id(`stew-${s.id}`).px(8).h(32).flex_none().rounded(8).items_center().gap(7)
-      .when(Boolean(space?.active), (el) => el.bg(t.selected))
-      .cursor_pointer().hover((el) => el.bg(t.hover))
-      .on_click((_e, cx) => (space ? run("space.select", { id: space.id }) : this.toggle(this.open, s.id, cx, "open")))
-      .on_mouse_down("right", () => this.menuFor(s))
-      .child(div().id(`readme-${s.id}`).flex_none().rounded(4).text_color(t.dim)
-        .hover((el) => el.bg(t.hover).text_color(t.foreground))
-        .tooltip(open ? "Hide its README" : "Show its README")
-        .on_click((_e, cx) => { cx.stop_propagation(); this.toggle(this.open, s.id, cx, "open"); })
-        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11)))
-      .child(title)
-      .children(words.map((w) => this.tag(t, w)))
-      .when(Boolean(busy), (el) => el.child(this.tag(t, `${busy}…`, t.muted))
-        .child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.muted).spin(900)))
-      .when(down && Boolean(play), (el) => el.child(div().id(`play-${s.id}`).flex_none().p(3).rounded(5)
+    const play = busy || running ? null : s.state === "stopped" ? ["start", "starting"] : !s.site ? ["open", "opening"] : null;
+    const where = [s.site ?? null, !running && s.updated > 0 ? age(now - s.updated) : null].filter(Boolean).join(" · ");
+    const first = h_flex().gap(8).items_center()
+      .child(div().flex_1().min_w(0).truncate().text_color(running ? t.foreground : closed ? t.dim : t.muted).child(s.title || s.id))
+      .child(this.tag(t, short(s.id)));
+    const second = h_flex().h(18).gap(6).items_center()
+      .when(Boolean(busy), (el) => el
+        .child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.muted).spin(900))
+        .child(this.tag(t, `${busy}…`, t.muted)))
+      .when(!busy && running && Boolean(st), (el) => el.child(this.status(t, st, true)))
+      .when(!busy, (el) => el.child(this.tag(t, s.state, running ? t.muted : t.dim)))
+      .when(Boolean(where), (el) => el.child(this.tag(t, `· ${where}`)))
+      .child(div().flex_1())
+      .when(Boolean(play), (el) => el.child(div().id(`play-${s.id}`).flex_none().p(3).rounded(5)
         .text_color(t.muted).hover((el) => el.bg(t.raised).text_color(t.foreground))
-        .tooltip(play[0] === "start" ? "Start it" : "Open it again (a new box, its repos cloned)")
+        .tooltip(play?.[0] === "start" ? "Start it" : "Open it again (a new box, its repos cloned)")
         .on_click((_e, cx) => { cx.stop_propagation(); this.act(cx, play[0], s, play[1]); })
-        .child(svg("mods/stews/play.svg").size(12))))
-      .when(running && Boolean(st), (el) => el.child(this.status(t, st, true)))
-      .when(!running && !play && !busy && s.updated > 0, (el) => el.child(this.tag(t, age(now - s.updated))));
-  }
-
-  readme(t, s) {
-    const text = (s.readme ?? "").trim();
-    return div().id(`md-${s.id}`).ml(26).mr(8).mb(6).px(10).py(8).rounded(8).bg(t.surface).text_size(12.5)
-      .child(text ? TextView.markdown(`md-text-${s.id}`, text).selectable(true) : div().text_color(t.dim).child("No README yet."));
+        .child(svg("mods/stews/play.svg").size(12))));
+    return v_flex().id(`stew-${s.id}`).px(10).py(6).mt(2).flex_none().rounded(8).gap(1)
+      .when(Boolean(space?.active), (el) => el.bg(t.selected))
+      .when(Boolean(space), (el) => el.cursor_pointer().hover((el) => el.bg(t.hover))
+        .on_click(() => run("space.select", { id: space.id })))
+      .on_mouse_down("right", () => this.menuFor(s))
+      .child(first)
+      .child(second);
   }
 
   render(cx) {
@@ -273,7 +265,6 @@ export default class Stews extends View {
       order.push(...leads.map((a) => a.address));
       return [
         this.stewRow(t, s, space, mine, now),
-        ...(this.open.has(s.id) ? [this.readme(t, s)] : []),
         ...leads.flatMap((a) => {
           const subs = this.tree(all, a.address);
           return [this.agentRow(t, a, subs, shown), ...(this.folded.has(a.address) ? [] : subs.map((x) => this.subRow(t, x, shown)))];
