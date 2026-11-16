@@ -200,6 +200,33 @@ impl Hc {
             .collect())
     }
 
+    /// Waits until the machine is connected: one just started (a box's boot) is still
+    /// unreachable to hc until its next retry (≤30 s), and its terminals aren't listed
+    /// until then. Gives up after `limit` with its last state.
+    fn wait_connected(&self, id: &str, limit: Duration) -> Result<()> {
+        let end = std::time::Instant::now() + limit;
+        loop {
+            let v = self.ok(&["machine", "ls", "--json"], SHORT)?;
+            let m = v["machines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|m| m["name"].as_str() == Some(id));
+            let state = m.and_then(|m| m["state"].as_str()).unwrap_or("unknown");
+            if state == "connected" {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= end {
+                let why = m.and_then(|m| m["why"].as_str()).unwrap_or("");
+                return Err(fail!(
+                    "hc has {id} {state} after {}s: {why}",
+                    limit.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn terminals(&self) -> Result<Vec<Value>> {
         let v = self.ok(&["ls", "--json"], SHORT)?;
         Ok(v["terminals"].as_array().cloned().unwrap_or_default())
@@ -237,6 +264,8 @@ pub fn core_socket() -> PathBuf {
 const SHORT: Duration = Duration::from_secs(30);
 /// `machine add` dials (hc gives a dial 20 s) and `run` waits for the machine's connection.
 const LONG: Duration = Duration::from_secs(60);
+/// How long a connect waits for hc to reach a machine again (hc retries every ≤30 s).
+const RECONNECT: Duration = Duration::from_secs(45);
 
 /// `t3` → the terminal's machine part (`box` in `box/t3`); None for the hub's own.
 fn machine_of(address: &str) -> Option<&str> {
@@ -261,6 +290,7 @@ impl Runtime for Hc {
                 return Err(fail!("hc added {id} as '{name}'"));
             }
         }
+        self.wait_connected(id, RECONNECT)?;
         // the stew's space: a shell, unless the space already has a terminal
         let space = format!("herdr.space={SPACE}");
         let v = self.ok(&["ls", "--label", &space, "--json"], SHORT)?;
