@@ -57,9 +57,13 @@ in
       Requires = [ "stew.socket" ];
       After = [ "stew.socket" ];
     };
+    # what the daemon starts outlives it: a box's VM (bento detaches it from the session,
+    # not from this unit's cgroup) and a host stew's hc core. With the default
+    # control-group, its idle exit (or a restart, as at a switch) killed every box it started.
     Service = {
       ExecStart = "${lib.getExe stew} daemon --idle-exit ${toString idleExit}";
       Environment = env;
+      KillMode = "process";
     };
   };
 
