@@ -103,6 +103,9 @@ pub enum Call {
         agent: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// claude's account (`CLAUDE_ACCOUNT_<NAME>_TOKEN` where the stew lives).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     /// A tracked stew recreated on a site; a closed one is reopened.
     Open {
@@ -153,6 +156,9 @@ pub enum Call {
         agent: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// claude's account (`CLAUDE_ACCOUNT_<NAME>_TOKEN` where the stew lives).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
         task: String,
     },
     /// Where an agent's live terminal is attached from (the client runs it).

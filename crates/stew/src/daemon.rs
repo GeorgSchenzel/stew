@@ -184,6 +184,7 @@ impl Hub {
                 start,
                 agent,
                 model,
+                account,
             } => self.new_stew(crate::ops::NewArgs {
                 site: match caller {
                     Some(c) => Some(self.site_for_stew(&config, c, site.as_deref())?),
@@ -200,6 +201,7 @@ impl Hub {
                 start,
                 agent,
                 model,
+                account,
             }),
             Call::Info => match caller {
                 Some(id) => self.info(id),
@@ -209,11 +211,13 @@ impl Hub {
                 id,
                 agent,
                 model,
+                account,
                 task,
             } => self.agent(
                 &self.full_id(&config, &id)?,
                 agent.as_deref(),
                 model.as_deref(),
+                account.as_deref(),
                 &task,
                 caller,
             ),
@@ -565,6 +569,7 @@ mod tests {
                         start: true,
                         agent: None,
                         model: None,
+                        account: None,
                     },
                 },
                 true,

@@ -71,6 +71,7 @@ pub struct NewArgs {
     pub start: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
+    pub account: Option<String>,
 }
 
 impl Hub {
@@ -144,8 +145,8 @@ impl Hub {
         if a.start && a.brief.is_none() {
             return Err(fail!("--start needs --brief"));
         }
-        if (a.agent.is_some() || a.model.is_some()) && !a.start {
-            return Err(fail!("--agent and --model go with --start"));
+        if (a.agent.is_some() || a.model.is_some() || a.account.is_some()) && !a.start {
+            return Err(fail!("--agent, --model and --account go with --start"));
         }
         if a.brief
             .as_ref()
@@ -159,11 +160,13 @@ impl Hub {
         // the agent's command line, checked before anything exists
         let launch = if a.start {
             runtime::can_run(&config)?;
-            let (agent, model) = agent::choose(&config, a.agent.as_deref(), a.model.as_deref());
-            Some((
-                agent.clone(),
-                agent::command(&agent, model.as_deref(), agent::BRIEF_TASK)?,
-            ))
+            let choice = agent::choose(
+                &config,
+                a.agent.as_deref(),
+                a.model.as_deref(),
+                a.account.as_deref(),
+            );
+            Some((choice.prefix(), agent::command(&choice, agent::BRIEF_TASK)?))
         } else {
             None
         };
@@ -875,12 +878,14 @@ impl Hub {
         id: &str,
         agent: Option<&str>,
         model: Option<&str>,
+        account: Option<&str>,
         task: &str,
         caller: Option<&str>,
     ) -> Result<Reply> {
         let config = Config::load(&self.paths)?;
-        let (agent, model) = agent::choose(&config, agent, model);
-        let argv = agent::command(&agent, model.as_deref(), task)?;
+        let choice = agent::choose(&config, agent, model, account);
+        let argv = agent::command(&choice, task)?;
+        let agent = choice.prefix();
         runtime::can_run(&config)?;
         let (placed, driver) = self.placed(&config, id)?;
         let mut warnings = Vec::new();

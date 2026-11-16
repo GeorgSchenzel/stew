@@ -34,11 +34,16 @@ Development (no cargo on the host): `nix develop --no-pure-eval -c just test`, a
 core in their own dirs. Packages: `nix build .#stew`, `.#stew-box`, `.#herdr-core`.
 
 Commands: `stew new [repos…] --title t [--site s] [--branch[=name]] [--base b] [--brief f
-[--start] [--agent a] [--model m]]`, `agent <id> [--agent a] [--model m] "<task>"`, `attach
+[--start] [--agent a] [--model m] [--account n]]`, `agent <id> [--agent a] [--model m] [--account n] "<task>"`, `attach
 <id>/<name>`, `skills`, `skill`, `open <id>
 [--site s]`, `remove|close <id> [--force]`, `start <id>|--all`, `stop <id>`, `enter <id>`,
 `exec <id> [--no-start] [-t] -- cmd…`, `export <id>|--all [--push]`, `title <id> <title>`, `ls [--json]`, `ls --all
 [search] [--closed]`, `ls --waiting`, `ls --from <id>`, `daemon [--socket p] [--idle-exit s]`.
+`--account n` (claude only, to spread usage over subscriptions) starts claude with
+`CLAUDE_CODE_OAUTH_TOKEN` from `CLAUDE_ACCOUNT_<N>_TOKEN`, which bento's claude preset sets
+per account; its terminal is `claude-<n>-<k>`. None given: `account:` in the config, else
+the box's default account. An agent's own helpers (`hc run`) get the box's default.
+
 Wherever a command takes an `<id>`, its short form works too: the four random chars at
 its end (`k3fq` for `port-forwarding-k3fq`), unique among tracked stews (a claim skips a
 short form in use). Long commands print their steps on stderr (`stew: <id>: …`; the
@@ -68,7 +73,7 @@ fails evaluation unless your pkgs allow it (`nixpkgs.config.allowUnfree = true`,
 yourself and leave it out.
 
 Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `scan: <dir>|false`, `agent:`,
-`model:`, `runtime: hc|none`, ...),
+`model:`, `account:`, `runtime: hc|none`, ...),
 the catalog in `~/.config/stew/repos.yaml` (nested groups; a string is a remote).
 State: `~/.local/state/stew/state.json`; the artifacts mirror:
 `~/.local/share/stew/artifacts.git`; the transcripts checkout:

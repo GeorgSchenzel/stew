@@ -51,6 +51,9 @@ enum Cmd {
         /// Its model, passed through as --model
         #[arg(long, requires = "start")]
         model: Option<String>,
+        /// claude's account (to spread usage; default from config.yaml, else the box's)
+        #[arg(long, requires = "start")]
+        account: Option<String>,
     },
     /// Start an agent in a stew you started, on a task; prints its address
     Agent {
@@ -59,6 +62,9 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// claude's account (to spread usage; default: the hub's config, else the box's)
+        #[arg(long)]
+        account: Option<String>,
         task: String,
     },
     /// Stews started from a stew (`.`: this one), with agents and Now lines
@@ -142,6 +148,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             start,
             agent,
             model,
+            account,
         } => {
             let here = if base.is_none() { here() } else { None };
             let brief = brief.map(|f| read_brief(&f)).transpose()?;
@@ -157,6 +164,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 start,
                 agent,
                 model,
+                account,
             })? {
                 Reply::Created {
                     id,
@@ -177,11 +185,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             id,
             agent,
             model,
+            account,
             task,
         } => match call(Call::Agent {
             id,
             agent,
             model,
+            account,
             task,
         })? {
             Reply::Started { address, warnings } => {

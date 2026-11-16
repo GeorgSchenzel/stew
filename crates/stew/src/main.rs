@@ -47,6 +47,9 @@ enum Cmd {
         /// Its model, passed through as --model
         #[arg(long, requires = "start")]
         model: Option<String>,
+        /// claude's account (to spread usage; default from config.yaml, else the box's)
+        #[arg(long, requires = "start")]
+        account: Option<String>,
     },
     /// Start an agent in a stew on a task; prints its address
     Agent {
@@ -56,6 +59,9 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// claude's account (to spread usage; default from config.yaml, else the box's)
+        #[arg(long)]
+        account: Option<String>,
         task: String,
     },
     /// An agent's live terminal (`<id>/<name>`, or a name only one stew has); ctrl+\ leaves it
@@ -192,6 +198,7 @@ fn run(cli: Cli) -> Result<u8> {
             start,
             agent,
             model,
+            account,
         } => {
             let here = if base.is_none() { here() } else { None };
             let brief = brief.map(|f| read_brief(&f)).transpose()?;
@@ -209,6 +216,7 @@ fn run(cli: Cli) -> Result<u8> {
                     start,
                     agent,
                     model,
+                    account,
                 },
             )?;
             created(reply)
@@ -217,6 +225,7 @@ fn run(cli: Cli) -> Result<u8> {
             id,
             agent,
             model,
+            account,
             task,
         } => match call(
             &paths,
@@ -224,6 +233,7 @@ fn run(cli: Cli) -> Result<u8> {
                 id,
                 agent,
                 model,
+                account,
                 task,
             },
         )? {

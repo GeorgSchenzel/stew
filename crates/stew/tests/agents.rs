@@ -726,6 +726,7 @@ fn the_token_and_what_a_stew_may_ask() {
             start: false,
             agent: None,
             model: None,
+            account: None,
         },
     ] {
         refused(t.raw(&req(None, None, call.clone())), "names its stew");
@@ -748,6 +749,7 @@ fn the_token_and_what_a_stew_may_ask() {
                 start: false,
                 agent: None,
                 model: None,
+                account: None,
             },
         )),
         "default site",
@@ -805,6 +807,7 @@ fn the_token_and_what_a_stew_may_ask() {
             start: false,
             agent: None,
             model: None,
+            account: None,
         },
     )) else {
         panic!()

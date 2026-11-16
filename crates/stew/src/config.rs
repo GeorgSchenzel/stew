@@ -25,6 +25,9 @@ pub struct Config {
     pub agent: Option<String>,
     /// The model for that agent (passed through as `--model`).
     pub model: Option<String>,
+    /// claude's account when a call names none (bento's preset: `CLAUDE_ACCOUNT_<NAME>_TOKEN`
+    /// where the stew lives); none: the box's default account.
+    pub account: Option<String>,
     /// The agent runtime: `hc` (default) or `none` (no machines, no agents).
     pub runtime: Option<RuntimeKind>,
     /// Where stews live, by name. None: `desktop` (bento) and `desktop-host` (host).
