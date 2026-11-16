@@ -153,6 +153,25 @@
               stand-in-bento
             ]) "the agents' tools or bento are not on the units' PATH";
             pkgs.writeText "stew-units.json" plain;
+          # herdr: off by default; on, the panel's files and its layout, each linked from ./herdr
+          herdr =
+            let
+              files = (eval { services.stew.herdr.enable = true; }).config.xdg.configFile;
+            in
+            assert lib.attrNames files == [
+              "herdr-app/layouts/stews.json"
+              "herdr-app/mods/stews/main.js"
+              "herdr-app/mods/stews/mod.json"
+              "herdr-app/mods/stews/play.svg"
+            ];
+            # the layout shows the panel
+            assert lib.hasInfix ''"mod": "stews"'' (builtins.readFile files."herdr-app/layouts/stews.json".source);
+            pkgs.runCommand "stew-herdr" { } ''
+              ${lib.concatMapStrings (f: ''
+                test -f ${f.source}
+              '') (lib.attrValues files)}
+              touch $out
+            '';
           host-skills =
             assert module.config.home.file == { } && module.config.xdg.configFile == { };
             assert lib.attrNames links == lib.sort lib.lessThan wanted;

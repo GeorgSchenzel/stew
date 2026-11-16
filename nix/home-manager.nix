@@ -4,7 +4,9 @@
 # packages default to this flake's and nixpkgs'; the units use their store paths, never a
 # profile, so what host stews' agents may run is `agentPackages` (and `extraPackages`).
 # `hostSkills.enable` (off by default) links the stew skill and hc's stub, from the package,
-# into the host's claude and opencode skills dirs.
+# into the host's claude and opencode skills dirs. `herdr.enable` (off by default) links the
+# herdr-app `stews` panel and the `stews` layout that shows it (../herdr) into herdr-app's
+# config dir, file by file (the dirs stay herdr-app's).
 # With bento's module (`programs.bento`) imported, `bento.enable` (off by default) adds
 # stew's parts to bento's global config: the `stew` channel to the stews' socket, the in-box client and hc as box
 # tools (pinned to this flake's rev), the skills dir in both agents' skills dirs, and
@@ -87,6 +89,11 @@ in
       the stew skill and hc's stub for the host's own agents: linked into
       `~/.claude/skills/` and `~/.config/opencode/skills/` from the stew package
       (`share/stew/skills`), store paths only. Independent of `enable`'';
+    herdr.enable = lib.mkEnableOption ''
+      herdr-app's `stews` panel (`mods/stews`, every stew with its agents, start and stop)
+      and the `stews` layout (Herdr's main layout with the panel in place of spaces and
+      agents), linked into `~/.config/herdr-app/`; switch to it once with
+      `herdr-app do layout.switch '{"name":"stews"}'`. Independent of `enable`'';
     bento = {
       enable = lib.mkEnableOption ''
         stew's parts of bento's global config (`programs.bento.settings`): the `stew` channel,
@@ -132,6 +139,16 @@ in
           xdg.configFile = links "opencode/skills";
         }
       ))
+      (lib.mkIf cfg.herdr.enable {
+        xdg.configFile = lib.listToAttrs (
+          map (f: lib.nameValuePair "herdr-app/${f}" { source = "${../herdr}/${f}"; }) [
+            "mods/stews/main.js"
+            "mods/stews/mod.json"
+            "mods/stews/play.svg"
+            "layouts/stews.json"
+          ]
+        );
+      })
       (lib.mkIf cfg.enable {
         assertions = [
           {
