@@ -172,7 +172,7 @@ export default class Stews extends View {
   agentRow(t, a, subs, shown) {
     const pic = icon(a.program, 15, t.foreground);
     const open = !this.folded.has(a.address);
-    return h_flex().id(`ag-${a.address}`).pl(18).pr(8).h(28).flex_none().rounded(8).items_center().gap(8)
+    return h_flex().id(`ag-${a.address}`).px(10).h(28).flex_none().items_center().gap(8).text_size(12.5)
       .when(a.focused, (el) => el.bg(t.selected))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click(() => run("pane.focus", { pane: a.pane }))
@@ -191,7 +191,7 @@ export default class Stews extends View {
     const k = s.t;
     const pic = icon(k.program, 13, t.foreground);
     const on = k.address === shown;
-    return h_flex().id(`sub-${k.address}`).pl(36).pr(8).h(25).flex_none().rounded(8).items_center().text_size(12.5)
+    return h_flex().id(`sub-${k.address}`).pl(18).pr(10).h(25).flex_none().items_center().text_size(12)
       .when(on, (el) => el.bg(t.raised))
       .hover((st) => st.bg(t.hover))
       .on_click(() => (this.listed.has(k.address) ? run("pane.focus", { terminal: k.address }) : run("terminal.peek", { terminal: k.address })))
@@ -210,37 +210,59 @@ export default class Stews extends View {
 
   // Two lines: the title with its short id on the right; under it what it's doing (its
   // agents' most urgent status, or its state), where it is, and the play button.
-  stewRow(t, s, space, mine, now) {
+  stewHead(t, s, mine, now) {
     const running = s.state === "running";
     const busy = this.busy[s.id];
     const closed = s.state === "closed";
     const st = top(mine.map((a) => a.status));
     // what the play button does: a stopped stew starts, one on no site is opened there again
     const play = busy || running ? null : s.state === "stopped" ? ["start", "starting"] : !s.site ? ["open", "opening"] : null;
-    const where = [s.site ?? null, !running && s.updated > 0 ? age(now - s.updated) : null].filter(Boolean).join(" · ");
+    const words = [busy ? `${busy}…` : s.state, s.site, !running && s.updated > 0 ? age(now - s.updated) : null];
     const first = h_flex().gap(8).items_center()
-      .child(div().flex_1().min_w(0).truncate().text_color(running ? t.foreground : closed ? t.dim : t.muted).child(s.title || s.id))
+      .when(running, (el) => el.child(div().size(7).flex_none().rounded(4).bg(t.ansi2)))
+      .child(div().flex_1().min_w(0).truncate()
+        .when(running, (el) => el.text_size(13.5).font_semibold().text_color(t.foreground))
+        .when(!running, (el) => el.text_color(closed ? t.dim : t.muted))
+        .child(s.title || s.id))
       .child(this.tag(t, short(s.id)));
     const second = h_flex().h(18).gap(6).items_center()
-      .when(Boolean(busy), (el) => el
-        .child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.muted).spin(900))
-        .child(this.tag(t, `${busy}…`, t.muted)))
-      .when(!busy && running && Boolean(st), (el) => el.child(this.status(t, st, true)))
-      .when(!busy, (el) => el.child(this.tag(t, s.state, running ? t.muted : t.dim)))
-      .when(Boolean(where), (el) => el.child(this.tag(t, `· ${where}`)))
-      .child(div().flex_1())
+      .when(running, (el) => el.pl(15))
+      .when(Boolean(busy), (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.muted).spin(900)))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(running || busy ? t.muted : t.dim).child(words.filter(Boolean).join(" · ")))
+      .when(running && Boolean(st), (el) => el.child(this.status(t, st, true)))
       .when(Boolean(play), (el) => el.child(div().id(`play-${s.id}`).flex_none().p(3).rounded(5)
         .text_color(t.muted).hover((el) => el.bg(t.raised).text_color(t.foreground))
         .tooltip(play?.[0] === "start" ? "Start it" : "Open it again (a new box, its repos cloned)")
         .on_click((_e, cx) => { cx.stop_propagation(); this.act(cx, play[0], s, play[1]); })
         .child(svg("mods/stews/play.svg").size(12))));
-    return v_flex().id(`stew-${s.id}`).px(10).py(6).mt(2).flex_none().rounded(8).gap(1)
-      .when(Boolean(space?.active), (el) => el.bg(t.selected))
-      .when(Boolean(space), (el) => el.cursor_pointer().hover((el) => el.bg(t.hover))
-        .on_click(() => run("space.select", { id: space.id })))
+    return v_flex().gap(2).child(first).child(second);
+  }
+
+  // A running stew: a card, its agents inside under a line. Click: its space.
+  card(t, s, space, mine, agentRows, now) {
+    const on = Boolean(space?.active);
+    return v_flex().id(`stew-${s.id}`).mb(6).flex_none().rounded(10).overflow_hidden()
+      .bg(t.background).border_1().border_color(on ? t.accent : t.border)
       .on_mouse_down("right", () => this.menuFor(s))
-      .child(first)
-      .child(second);
+      .child(div().id(`head-${s.id}`).px(10).py(8)
+        .when(Boolean(space), (el) => el.cursor_pointer().hover((el) => el.bg(t.hover))
+          .on_click(() => run("space.select", { id: space.id })))
+        .child(this.stewHead(t, s, mine, now)))
+      .when(agentRows.length > 0, (el) => el.child(v_flex().py(3).border_t(1).border_color(t.border).children(agentRows)));
+  }
+
+  // A stew that isn't running: a plain row.
+  row(t, s, now) {
+    return div().id(`stew-${s.id}`).px(10).py(6).flex_none().rounded(8)
+      .hover((el) => el.bg(t.hover))
+      .on_mouse_down("right", () => this.menuFor(s))
+      .child(this.stewHead(t, s, [], now));
+  }
+
+  section(t, id, label, n) {
+    return h_flex().id(`sec-${id}`).px(10).pt(10).pb(4).flex_none().gap(6).items_center().text_size(11).font_medium()
+      .child(div().text_color(t.dim).child(label))
+      .child(div().text_color(t.dim).opacity(0.7).child(String(n)));
   }
 
   render(cx) {
@@ -256,21 +278,29 @@ export default class Stews extends View {
     const recent = (s) => s.state !== "closed" || this.all || !s.closed || now - Date.parse(s.closed) / 1000 < RECENT;
     const hidden = this.stews.filter((s) => !recent(s)).length;
     const order = [];
-    const rows = this.stews.filter(recent).flatMap((s) => {
+    const shownStews = this.stews.filter(recent);
+    const running = shownStews.filter((s) => s.state === "running");
+    const resting = shownStews.filter((s) => s.state !== "running" && s.state !== "closed");
+    const closed = shownStews.filter((s) => s.state === "closed");
+    const cards = running.map((s) => {
       const space = byMachine.get(s.id);
       const mine = space ? list.filter((a) => a.space === space.id) : [];
       // a kept sub-agent (with a pane) shows in its parent's tree, not twice
       const nested = new Set(mine.flatMap((a) => this.tree(all, a.address).map((x) => x.t.address)));
       const leads = mine.filter((a) => !nested.has(a.address));
       order.push(...leads.map((a) => a.address));
-      return [
-        this.stewRow(t, s, space, mine, now),
-        ...leads.flatMap((a) => {
-          const subs = this.tree(all, a.address);
-          return [this.agentRow(t, a, subs, shown), ...(this.folded.has(a.address) ? [] : subs.map((x) => this.subRow(t, x, shown)))];
-        }),
-      ];
+      const agentRows = leads.flatMap((a) => {
+        const subs = this.tree(all, a.address);
+        return [this.agentRow(t, a, subs, shown), ...(this.folded.has(a.address) ? [] : subs.map((x) => this.subRow(t, x, shown)))];
+      });
+      return this.card(t, s, space, mine, agentRows, now);
     });
+    const group = (id, label, items) => (items.length ? [this.section(t, id, label, items.length), ...items] : []);
+    const rows = [
+      ...group("running", "Running", cards),
+      ...group("resting", "Not running", resting.map((s) => this.row(t, s, now))),
+      ...group("closed", "Closed", closed.map((s) => this.row(t, s, now))),
+    ];
     setAgentOrder(order);
     const creating = this.creations.map((c) => h_flex().id(`new-${c.id}`).px(8).h(28).flex_none().items_center().gap(7).text_size(12)
       .text_color(c.state === "failed" ? t.blocked : t.muted)

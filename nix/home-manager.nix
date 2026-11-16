@@ -94,6 +94,15 @@ in
       and the `stews` layout (Herdr's main layout with the panel in place of spaces and
       agents), linked into `~/.config/herdr-app/`; switch to it once with
       `herdr-app do layout.switch '{"name":"stews"}'`. Independent of `enable`'';
+    herdr.liveFrom = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/home/me/src/stew/herdr";
+      description = ''
+        With `herdr.enable`: link the panel's files to this checkout's `herdr/` dir instead of
+        the store, so edits there show in herdr-app at once (to work on the panel).
+      '';
+    };
     bento = {
       enable = lib.mkEnableOption ''
         stew's parts of bento's global config (`programs.bento.settings`): the `stew` channel,
@@ -141,7 +150,16 @@ in
       ))
       (lib.mkIf cfg.herdr.enable {
         xdg.configFile = lib.listToAttrs (
-          map (f: lib.nameValuePair "herdr-app/${f}" { source = "${../herdr}/${f}"; }) [
+          map (
+            f:
+            lib.nameValuePair "herdr-app/${f}" {
+              source =
+                if cfg.herdr.liveFrom == null then
+                  "${../herdr}/${f}"
+                else
+                  config.lib.file.mkOutOfStoreSymlink "${cfg.herdr.liveFrom}/${f}";
+            }
+          ) [
             "mods/stews/main.js"
             "mods/stews/mod.json"
             "mods/stews/play.svg"
