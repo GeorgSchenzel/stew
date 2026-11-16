@@ -201,10 +201,9 @@ impl Mirror {
             .and_then(|m| m.from))
     }
 
-    /// Tracked stews, most recent first: the open ones, or with `closed` the closed
-    /// ones. With `search`, those of either kind whose id, title or any notes file
-    /// contains it (case-insensitive). Unreadable `stew.yaml` files are skipped with a
-    /// warning.
+    /// Tracked stews, most recent first: the open ones, with `closed` the closed ones
+    /// too. With `search`, those of either kind whose id, title or any notes file contains
+    /// it (case-insensitive). Unreadable `stew.yaml` files are skipped with a warning.
     pub fn tracked(
         &self,
         search: Option<&str>,
@@ -212,7 +211,7 @@ impl Mirror {
     ) -> Result<(Vec<Tracked>, Vec<String>)> {
         let search = search.map(str::trim).filter(|t| !t.is_empty());
         let (mut out, warnings) =
-            self.load(|meta| search.is_some() || meta.is_closed() == closed)?;
+            self.load(|meta| search.is_some() || closed || !meta.is_closed())?;
         if let Some(term) = search {
             let lower = term.to_lowercase();
             let hit = |t: &Tracked| {
@@ -290,12 +289,10 @@ impl Mirror {
             if !keep(&meta) {
                 continue;
             }
-            let summary = readme::summarize(readme.as_deref().unwrap_or_default());
             out.push(Tracked {
                 meta,
                 updated: *updated,
-                description: summary.description,
-                now: summary.now,
+                readme: readme.unwrap_or_default(),
             });
         }
         Ok((out, warnings))

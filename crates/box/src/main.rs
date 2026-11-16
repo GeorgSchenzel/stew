@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
-use stew_proto::show::{live_table, printable};
+use stew_proto::show::{printable, table};
 use stew_proto::{Call, ErrorKind, Here, Reply, Request, StewMeta};
 
 /// Stews: workspaces of repo clones in a box (the client inside a stew).
@@ -117,14 +117,20 @@ fn run(cli: Cli) -> Result<(), Failure> {
             other => Err(unexpected(other)),
         },
         Cmd::Info => match call(Call::Info)? {
-            Reply::Info { stew, driver, root } => {
+            Reply::Info {
+                stew,
+                repos,
+                driver,
+                root,
+            } => {
                 println!("{}  {}", stew.id, stew.title);
                 if let Some(f) = &stew.from {
                     println!("from    {f}");
                 }
-                println!("site    {} ({driver}), {}", stew.site, stew.state);
+                let site = stew.site.as_deref().unwrap_or("-");
+                println!("site    {site} ({driver}), {}", stew.state);
                 println!("root    {root}");
-                for r in &stew.repos {
+                for r in &repos {
                     let b = if r.branch.is_empty() {
                         "(detached)"
                     } else {
@@ -202,7 +208,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             other => Err(unexpected(other)),
         },
         Cmd::Ls { from, json } => match call(Call::LsFrom { id: from })? {
-            Reply::Live {
+            Reply::Listed {
                 stews,
                 creations,
                 warnings,
@@ -213,7 +219,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                         serde_json::to_string_pretty(&stews).map_err(|e| (1, e.to_string()))?;
                     println!("{text}");
                 } else {
-                    print!("{}", live_table(&stews, &creations));
+                    print!("{}", table(&stews, &creations, false));
                 }
                 Ok(())
             }

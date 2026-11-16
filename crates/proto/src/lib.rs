@@ -18,7 +18,7 @@ pub mod show;
 pub const SKILL: &str = include_str!("../../../skills/stew/SKILL.md");
 
 /// Bumped when a request or reply changes incompatibly.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The longest request line the daemon reads (a brief travels inside one).
 pub const MAX_REQUEST: u64 = 4 << 20;
@@ -68,14 +68,6 @@ pub enum Call {
         base: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         here: Option<Here>,
-    },
-    /// Tracked stews, from the artifacts mirror: the open ones, or with `closed` the
-    /// closed ones; a search covers both.
-    LsAll {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        search: Option<String>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        closed: bool,
     },
     /// A new stew: resolve, claim, create on the site, clone, start.
     New {
@@ -134,8 +126,16 @@ pub enum Call {
     Stop { id: String },
     /// A new title, written to `stew.yaml` where the stew lives.
     Title { id: String, title: String },
-    /// Stews that exist on a site, with what they show live.
-    Ls,
+    /// Every open tracked stew, wherever it is, never looking into one: the daemon's
+    /// state, the drivers' state, the runtime's agents and the artifacts mirror as last
+    /// fetched. With `closed` the closed ones too; `search` keeps those whose id, title or
+    /// notes contain it.
+    Ls {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        closed: bool,
+    },
     /// Where a command runs for `exec` and `enter` (the client runs it itself).
     Where {
         id: String,
@@ -214,10 +214,6 @@ pub enum Reply {
         repos: Vec<Resolved>,
         warnings: Vec<String>,
     },
-    Tracked {
-        stews: Vec<Tracked>,
-        warnings: Vec<String>,
-    },
     /// `new` and `open`: the stew exists (with `--start`, its agent runs at `agent`).
     Created {
         id: String,
@@ -232,7 +228,9 @@ pub enum Reply {
     },
     /// The caller's stew.
     Info {
-        stew: Live,
+        stew: Listed,
+        /// Its clones and their branches, live.
+        repos: Vec<LiveRepo>,
         /// The site's driver (`bento`, `host`).
         driver: String,
         /// Where its root is on its site.
@@ -247,8 +245,8 @@ pub enum Reply {
     Done {
         warnings: Vec<String>,
     },
-    Live {
-        stews: Vec<Live>,
+    Listed {
+        stews: Vec<Listed>,
         /// Creations in progress or failed.
         creations: Vec<CreationInfo>,
         warnings: Vec<String>,
@@ -274,22 +272,27 @@ pub enum Reply {
     },
 }
 
-/// A stew that exists on a site, as `stew ls` shows it.
+/// A stew as `stew ls` shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Live {
+pub struct Listed {
     pub id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    pub site: String,
-    /// `running`, `stopped`, `missing`, `unreachable`, or the driver's own word.
+    /// Its site, while it is on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// On a site: `running`, `stopped`, `missing`, `unreachable`, or the driver's own
+    /// word. On none: `removed`, or `closed`.
     pub state: String,
-    /// Clones and their branches: live when running, else the last snapshot.
-    pub repos: Vec<LiveRepo>,
-    /// README's Now lines (live when running, else from the notes branch).
-    pub now: Vec<String>,
+    /// With `state: closed`: when, `YYYY-MM-DD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
     /// Unix time of the last commit on its notes branch (0: unknown).
     pub updated: i64,
+    /// Its `notes/README.md` as last fetched, unparsed.
+    #[serde(default)]
+    pub readme: String,
     /// Its agents in the runtime, while it runs.
     #[serde(default)]
     pub agents: Vec<AgentInfo>,
@@ -391,27 +394,14 @@ pub struct RepoRecord {
     pub branch: String,
 }
 
-/// A tracked stew as `ls --all` shows it: `stew.yaml` plus what its `README.md` says.
+/// A tracked stew in the artifacts mirror: `stew.yaml` and its `README.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tracked {
     #[serde(flatten)]
     pub meta: StewMeta,
     /// Unix time of the last commit on its notes branch (for recency).
     pub updated: i64,
-    /// README's paragraph on what the stew is about.
-    pub description: String,
-    /// README's `## Now` lines, one per item.
-    pub now: Vec<String>,
-}
-
-impl Tracked {
-    /// The Now lines that need a human (`waiting:`, `blocked:`).
-    pub fn waiting(&self) -> impl Iterator<Item = &str> {
-        self.now
-            .iter()
-            .map(String::as_str)
-            .filter(|l| l.starts_with("waiting:") || l.starts_with("blocked:"))
-    }
+    pub readme: String,
 }
 
 /// Writes one message as a line.
@@ -491,13 +481,13 @@ mod tests {
 
     #[test]
     fn request_lines() {
-        let req = Request::new(Call::LsAll {
+        let req = Request::new(Call::Ls {
             search: Some("x".into()),
             closed: false,
         });
         let mut buf = Vec::new();
         send(&mut buf, &req).unwrap();
-        assert_eq!(buf, b"{\"call\":\"ls_all\",\"search\":\"x\"}\n");
+        assert_eq!(buf, b"{\"call\":\"ls\",\"search\":\"x\"}\n");
         let back: Request = recv(&mut &buf[..]).unwrap().unwrap();
         assert_eq!(back, req);
 
@@ -528,21 +518,12 @@ mod tests {
                 repos: vec![],
             },
             updated: 1,
-            description: "d".into(),
-            now: vec![
-                "waiting: me".into(),
-                "x: blocked: no".into(),
-                "blocked: y".into(),
-            ],
+            readme: "# A\n".into(),
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["id"], "a-k3fq");
-        assert_eq!(v["description"], "d");
+        assert_eq!(v["readme"], "# A\n");
         assert!(v.get("from").is_none() && v.get("state").is_none());
-        assert_eq!(
-            t.waiting().collect::<Vec<_>>(),
-            ["waiting: me", "blocked: y"]
-        );
         assert!(!t.meta.is_closed());
     }
 }

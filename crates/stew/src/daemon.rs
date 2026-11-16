@@ -154,6 +154,24 @@ impl Hub {
     }
 
     fn dispatch(&self, call: Call, caller: Option<&str>) -> Result<Reply> {
+        // what pushes a notes branch: `ls` shows it at once, not after the next fetch
+        let pushes = matches!(
+            call,
+            Call::New { .. }
+                | Call::Open { .. }
+                | Call::Remove { .. }
+                | Call::Close { .. }
+                | Call::Stop { .. }
+                | Call::Title { .. }
+        );
+        let reply = self.dispatch_call(call, caller);
+        if pushes && let Err(e) = self.fetch_mirror() {
+            eprintln!("stew daemon: {e}");
+        }
+        reply
+    }
+
+    fn dispatch_call(&self, call: Call, caller: Option<&str>) -> Result<Reply> {
         // config and catalog are read per request, so edits apply without a restart
         let config = Config::load(&self.paths)?;
         match call {
@@ -265,7 +283,7 @@ impl Hub {
             }
             Call::Stop { id } => self.stop(&self.full_id(&config, &id)?),
             Call::Title { id, title } => self.title(&self.full_id(&config, &id)?, &title),
-            Call::Ls => self.ls(),
+            Call::Ls { search, closed } => self.ls(search.as_deref(), closed),
             Call::Export { id, push } => {
                 let id = id.map(|i| self.full_id(&config, &i)).transpose()?;
                 self.export(id.as_deref(), push)
@@ -276,19 +294,6 @@ impl Hub {
                 no_start,
                 tty,
             } => self.launch(&self.full_id(&config, &id)?, &argv, no_start, tty),
-            Call::LsAll { search, closed } => {
-                let mirror = self.mirror(&config)?;
-                let _lock = self.mirror_lock();
-                mirror.ensure()?;
-                let mut warnings = Vec::new();
-                // an unreachable remote is normal: list what the mirror has
-                if let Err(e) = mirror.fetch() {
-                    warnings.push(format!("{e} (showing the last fetched state)"));
-                }
-                let (stews, more) = mirror.tracked(search.as_deref(), closed)?;
-                warnings.extend(more);
-                Ok(Reply::Tracked { stews, warnings })
-            }
         }
     }
 
@@ -362,6 +367,15 @@ impl Hub {
         let remote = crate::url::normalize(config.artifacts(&self.paths)?)?;
         Ok(Mirror::new(self.paths.mirror(), remote))
     }
+
+    /// Fetches the artifacts mirror (made on first use): what `ls` reads.
+    pub fn fetch_mirror(&self) -> Result<()> {
+        let config = Config::load(&self.paths)?;
+        let mirror = self.mirror(&config)?;
+        let _lock = self.mirror_lock();
+        mirror.ensure()?;
+        mirror.fetch()
+    }
 }
 
 /// Compares tokens in time independent of where they differ.
@@ -434,12 +448,13 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
 /// listener and the stews'. The accept loop itself decides the idle exit, only when no
 /// connection is waiting on either: one already accepted is always served (connections not
 /// yet accepted stay with systemd's sockets). Between accepts it sleeps in `poll` (a second
-/// at most), never in a busy loop.
+/// at most), never in a busy loop. The artifacts mirror is fetched every `fetch_every`.
 pub fn serve(
     hub: Arc<Hub>,
     cli: UnixListener,
     stews: UnixListener,
     idle_exit: Option<Duration>,
+    fetch_every: Duration,
 ) -> Result<()> {
     eprintln!(
         "stew daemon: listening on {} (stews: {})",
@@ -448,6 +463,25 @@ pub fn serve(
     );
     cli.set_nonblocking(true)?;
     stews.set_nonblocking(true)?;
+    {
+        // `ls` never fetches: the mirror is kept fresh here (a failure is said once, until
+        // a fetch works again)
+        let hub = hub.clone();
+        thread::spawn(move || {
+            let mut failing = false;
+            loop {
+                match hub.fetch_mirror() {
+                    Ok(()) => failing = false,
+                    Err(e) if !failing => {
+                        eprintln!("stew daemon: {e}");
+                        failing = true;
+                    }
+                    Err(_) => {}
+                }
+                thread::sleep(fetch_every);
+            }
+        });
+    }
     loop {
         let mut accepted = false;
         for (listener, from_box) in [(&cli, false), (&stews, true)] {

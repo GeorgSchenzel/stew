@@ -63,6 +63,7 @@ impl Stew for Env {
         let socket = self.base.join("run/stew.sock");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_stew"));
         cmd.args(["daemon", "--socket", socket.to_str().unwrap()])
+            .args(["--fetch-every", "1"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -105,31 +106,43 @@ fn meta(title: &str) -> StewMeta {
 }
 
 #[test]
-fn ls_all_through_the_daemon() {
+fn ls_through_the_daemon() {
     let env = Env::new();
     let url = env.artifacts();
     let d = env.daemon();
 
-    let r = env.stew(&["ls", "--all"], &d.socket);
+    let r = env.stew(&["ls"], &d.socket);
     assert_eq!((r.code, r.stdout.as_str()), (0, ""), "{}", r.stderr);
 
-    // another hub claims; this daemon's mirror sees it at the next fetch
+    // another hub claims; this daemon's mirror sees it at its next fetch (`ls` never fetches)
     let other = Mirror::new(env.base.join("other/artifacts.git"), url.clone());
     let a = other.claim(&meta("Port forwarding"), None).unwrap();
     let b = other.claim(&meta("Something else"), None).unwrap();
-
-    let r = env.stew(&["ls", "--all", "--json"], &d.socket);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    let v: Value = serde_json::from_str(&r.stdout).unwrap();
-    let ids: Vec<_> = v
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids.len(), 2);
+    let ls = |args: &[&str]| {
+        let r = env.stew(args, &d.socket);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        r.stdout
+    };
+    let json = |args: &[&str]| -> Vec<Value> {
+        let v: Value = serde_json::from_str(&ls(args)).unwrap();
+        v["stews"].as_array().unwrap().clone()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let v = loop {
+        let v = json(&["ls", "--json"]);
+        if v.len() == 2 {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "not fetched: {v:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let ids: Vec<_> = v.iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
-    assert_eq!(v[0]["now"], serde_json::json!([]));
+    // tracked, on no site
+    assert_eq!(v[0]["state"], "removed");
+    assert!(v[0].get("site").is_none());
+    let pf = v.iter().find(|s| s["id"] == a.as_str()).unwrap();
+    assert_eq!(pf["readme"], "# Port forwarding\n\n## Now\n");
 
     // an agent in `a` writes its README; `b` gets closed
     for (id, dir) in [(&a, "wa"), (&b, "wb")] {
@@ -139,11 +152,9 @@ fn ls_all_through_the_daemon() {
         );
     }
     let wa = env.base.join("wa");
-    fs::write(
-        wa.join("README.md"),
-        "# Port forwarding\n\nPorts per box.\n\n## Now\n- loopback IPs: done\n- waiting: Georg applies the units\n",
-    )
-    .unwrap();
+    let readme =
+        "# Port forwarding\n\nPorts per box.\n\n## Now\n- waiting: Georg applies the units\n";
+    fs::write(wa.join("README.md"), readme).unwrap();
     env.git(&wa, &["commit", "-q", "-am", "now"]);
     env.git(&wa, &["push", "-q"]);
     let wb = env.base.join("wb");
@@ -155,71 +166,81 @@ fn ls_all_through_the_daemon() {
     .unwrap();
     env.git(&wb, &["commit", "-q", "-am", "closed"]);
     env.git(&wb, &["push", "-q"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while json(&["ls", "--json"]).len() != 1 {
+        assert!(Instant::now() < deadline, "not fetched");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    let r = env.stew(&["ls", "--all"], &d.socket);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    let lines: Vec<_> = r.stdout.lines().collect();
-    assert_eq!(lines.len(), 4, "{}", r.stdout);
-    assert!(lines[0].starts_with(&a) && lines[0].contains("Port forwarding"));
+    // one line each: title, short id, site, state; -l adds the README as it is
+    let short = |id: &str| id[id.len() - 4..].to_string();
+    let out = ls(&["ls"]);
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 1, "{out}");
+    assert!(
+        lines[0].starts_with(&format!("Port forwarding  {}  -  removed", short(&a))),
+        "{out}"
+    );
+    let out = ls(&["ls", "-l"]);
+    let lines: Vec<_> = out.lines().collect();
     assert_eq!(
         &lines[1..],
         [
+            "    # Port forwarding",
+            "",
             "    Ports per box.",
-            "    - loopback IPs: done",
-            "    - waiting: Georg applies the units"
-        ]
+            "",
+            "    ## Now",
+            "    - waiting: Georg applies the units",
+            ""
+        ],
+        "{out}"
     );
+    assert_eq!(json(&["ls", "--json"])[0]["readme"], readme);
 
-    let r = env.stew(&["ls", "--all", "--closed"], &d.socket);
-    assert_eq!(r.code, 0, "{}", r.stderr);
+    // --closed: the closed ones too, after the open ones
+    let out = ls(&["ls", "--closed"]);
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(lines[0].starts_with("Port forwarding"), "{out}");
     assert!(
-        r.stdout.starts_with(&b) && r.stdout.trim_end().ends_with("closed"),
-        "{}",
-        r.stdout
+        lines[1].starts_with("Something else") && lines[1].contains("closed"),
+        "{out}"
     );
-    assert_eq!(r.stdout.lines().count(), 1);
+    let closed = json(&["ls", "--closed", "--json"]);
+    assert_eq!(closed[1]["state"], "closed");
+    assert_eq!(closed[1]["closed"], "2026-11-15");
 
-    let r = env.stew(&["ls", "--waiting"], &d.socket);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(r.stdout, format!("{a}  waiting: Georg applies the units\n"));
-
-    // a search covers closed stews too
-    let r = env.stew(&["ls", "--all", "something"], &d.socket);
-    assert!(r.stdout.starts_with(&b), "{}", r.stdout);
-    let r = env.stew(&["ls", "--all", "forwarding"], &d.socket);
-    assert!(r.stdout.starts_with(&a), "{}", r.stdout);
+    // a search covers closed stews too, and the notes
+    assert!(ls(&["ls", "something"]).starts_with("Something else"));
+    assert!(ls(&["ls", "forwarding"]).starts_with("Port forwarding"));
+    assert!(ls(&["ls", "applies"]).starts_with("Port forwarding"));
     assert!(
         env.home
             .join(".local/share/stew/artifacts.git/HEAD")
             .exists()
     );
 
-    // the remote goes away: the last fetched state, with a warning
+    // the remote goes away: the last fetched state
     fs::rename(
         env.base.join("remotes/notes.git"),
         env.base.join("remotes/moved.git"),
     )
     .unwrap();
-    let r = env.stew(&["ls", "--all"], &d.socket);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(r.stdout.lines().count(), 4);
-    assert!(r.stderr.contains("warning: cannot fetch"), "{}", r.stderr);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(ls(&["ls"]).lines().count(), 1);
 }
 
 #[test]
 fn errors_reach_the_cli() {
     let env = Env::new();
     let d = env.daemon();
-    let r = env.stew(&["ls", "--all"], &d.socket);
-    assert_eq!(r.code, 1);
-    assert!(r.stderr.contains("no artifacts repo"), "{}", r.stderr);
-
     // stews on a site still list without the mirror, with a warning
     let r = env.stew(&["ls"], &d.socket);
     assert_eq!((r.code, r.stdout.as_str()), (0, ""));
     assert!(r.stderr.contains("no artifacts repo"), "{}", r.stderr);
 
-    let r = env.stew(&["ls", "--all"], &env.base.join("nobody.sock"));
+    let r = env.stew(&["ls"], &env.base.join("nobody.sock"));
     assert_eq!(r.code, 1);
     assert!(
         r.stderr.contains("cannot reach the stew daemon"),

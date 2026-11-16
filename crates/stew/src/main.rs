@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use stew::daemon::{self, Hub};
 use stew::error::{Error, Result};
 use stew::paths::Paths;
-use stew_proto::show::{age, live_table, now, printable};
-use stew_proto::{Call, Here, Reply, Request, Tracked};
+use stew_proto::show::{printable, table};
+use stew_proto::{Call, Here, Reply, Request};
 
 /// Stews: workspaces of repo clones in a box.
 #[derive(Parser)]
@@ -125,21 +125,18 @@ enum Cmd {
     },
     /// Change a stew's title
     Title { id: String, title: String },
-    /// List stews, most recent first: those on a site, or with --all every tracked one
+    /// List the open stews, wherever they are (running, stopped, removed), most recent first
     Ls {
-        /// Every open tracked stew, from the artifacts repo
-        #[arg(long)]
-        all: bool,
-        /// With --all: the closed ones instead
+        /// With each stew's README
+        #[arg(short = 'l', long)]
+        long: bool,
+        /// The closed ones too
         #[arg(long)]
         closed: bool,
-        /// Every Now line of an open stew that needs a human (`waiting:`, `blocked:`)
-        #[arg(long, conflicts_with_all = ["all", "closed", "search"])]
-        waiting: bool,
-        /// With --all: open and closed stews whose id, title or notes contain this
+        /// Open and closed stews whose id, title or notes contain this
         search: Option<String>,
         /// Tracked stews started from this one
-        #[arg(long, conflicts_with_all = ["all", "closed", "waiting", "search"])]
+        #[arg(long, conflicts_with_all = ["closed", "search"])]
         from: Option<String>,
         #[arg(long)]
         json: bool,
@@ -153,6 +150,9 @@ enum Cmd {
         /// Exit after this many seconds without a request (none in progress)
         #[arg(long)]
         idle_exit: Option<u64>,
+        /// Fetch the artifacts mirror (what `ls` reads) every this many seconds
+        #[arg(long, default_value_t = 60)]
+        fetch_every: u64,
     },
 }
 
@@ -169,7 +169,11 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     let paths = Paths::from_env()?;
     match cli.cmd {
-        Cmd::Daemon { socket, idle_exit } => {
+        Cmd::Daemon {
+            socket,
+            idle_exit,
+            fetch_every,
+        } => {
             let idle = idle_exit.map(Duration::from_secs);
             let (listener, stews, socket) = match (socket, daemon::activated()) {
                 (None, Some((l, stews))) => (l, stews, paths.socket()),
@@ -185,7 +189,13 @@ fn run(cli: Cli) -> Result<u8> {
                 None => daemon::bind(&box_socket)?,
             };
             let hub = Arc::new(Hub::open(paths, socket, box_socket)?);
-            daemon::serve(hub, listener, stews, idle)?;
+            daemon::serve(
+                hub,
+                listener,
+                stews,
+                idle,
+                Duration::from_secs(fetch_every.max(1)),
+            )?;
             Ok(0)
         }
         Cmd::New {
@@ -290,87 +300,35 @@ fn run(cli: Cli) -> Result<u8> {
             },
         ),
         Cmd::Ls {
-            from: Some(from),
+            from,
+            long,
+            closed,
+            search,
             json,
-            ..
         } => {
-            let Reply::Live {
+            let from_one = from.is_some();
+            let req = match from {
+                Some(id) => Call::LsFrom { id },
+                None => Call::Ls { search, closed },
+            };
+            let Reply::Listed {
                 stews,
                 creations,
                 warnings,
-            } = call(&paths, Call::LsFrom { id: from })?
+            } = call(&paths, req)?
             else {
                 return Err(Error::Fail("unexpected reply from the daemon".into()));
             };
             warn(&warnings);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&stews).expect("serializes")
-                );
-            } else {
-                print!("{}", live_table(&stews, &creations));
-            }
-            Ok(0)
-        }
-        Cmd::Ls {
-            all,
-            closed,
-            waiting,
-            search,
-            json,
-            ..
-        } => {
-            if !(all || closed || waiting) {
-                if search.is_some() {
-                    return Err(Error::Fail("a search needs --all".into()));
-                }
-                let Reply::Live {
-                    stews,
-                    creations,
-                    warnings,
-                } = call(&paths, Call::Ls)?
-                else {
-                    return Err(Error::Fail("unexpected reply from the daemon".into()));
-                };
-                warn(&warnings);
-                if json {
-                    let v = serde_json::json!({"stews": stews, "creations": creations});
-                    println!("{}", serde_json::to_string_pretty(&v).expect("serializes"));
-                } else {
-                    print!("{}", live_table(&stews, &creations));
-                }
-                return Ok(0);
-            }
-            let Reply::Tracked { stews, warnings } = call(&paths, Call::LsAll { search, closed })?
-            else {
-                return Err(Error::Fail("unexpected reply from the daemon".into()));
-            };
-            warn(&warnings);
-            if waiting {
-                let lines: Vec<(&str, &str)> = stews
-                    .iter()
-                    .flat_map(|t| t.waiting().map(|l| (t.meta.id.as_str(), l)))
-                    .collect();
-                if json {
-                    let v: Vec<_> = lines
-                        .iter()
-                        .map(|(id, line)| serde_json::json!({"id": id, "line": line}))
-                        .collect();
-                    println!("{}", serde_json::to_string_pretty(&v).expect("serializes"));
-                } else {
-                    let w = lines.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
-                    for (id, line) in lines {
-                        println!("{id:<w$}  {}", printable(line));
-                    }
-                }
+            if json && from_one {
+                // as in a stew's `ls --from .`: the stews alone
+                let v = serde_json::json!(stews);
+                println!("{}", serde_json::to_string_pretty(&v).expect("serializes"));
             } else if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&stews).expect("serializes")
-                );
+                let v = serde_json::json!({"stews": stews, "creations": creations});
+                println!("{}", serde_json::to_string_pretty(&v).expect("serializes"));
             } else {
-                print!("{}", printable(&table(&stews)));
+                print!("{}", table(&stews, &creations, long));
             }
             Ok(0)
         }
@@ -519,36 +477,4 @@ fn call(paths: &Paths, call: Call) -> Result<Reply> {
         Reply::Error { kind, message } => Err(Error::from_reply(kind, message)),
         r => Ok(r),
     }
-}
-
-/// Per stew: id, title, age (and `closed`), then its description and Now lines indented.
-fn table(stews: &[Tracked]) -> String {
-    let now = now();
-    let w0 = stews.iter().map(|t| t.meta.id.len()).max().unwrap_or(0);
-    let w1 = stews
-        .iter()
-        .map(|t| t.meta.title.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for t in stews {
-        let mut head = format!(
-            "{:<w0$}  {:<w1$}  {:>4}",
-            t.meta.id,
-            t.meta.title,
-            age(now - t.updated)
-        );
-        if t.meta.is_closed() {
-            head.push_str("  closed");
-        }
-        out.push_str(head.trim_end());
-        out.push('\n');
-        if !t.description.is_empty() {
-            out.push_str(&format!("    {}\n", t.description));
-        }
-        for line in &t.now {
-            out.push_str(&format!("    - {line}\n"));
-        }
-    }
-    out
 }

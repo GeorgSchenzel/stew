@@ -41,8 +41,12 @@ Commands: `stew new [repos…] --title t [--site s] [--branch[=name]] [--base b]
 [--start] [--agent a] [--model m] [--account n]]`, `agent <id> [--agent a] [--model m] [--account n] "<task>"`, `attach
 <id>/<name>`, `skills`, `skill`, `open <id>
 [--site s]`, `remove|close <id> [--force]`, `start <id>|--all`, `stop <id>`, `enter <id>`,
-`exec <id> [--no-start] [-t] -- cmd…`, `export <id>|--all [--push]`, `title <id> <title>`, `ls [--json]`, `ls --all
-[search] [--closed]`, `ls --waiting`, `ls --from <id>`, `daemon [--socket p] [--idle-exit s]`.
+`exec <id> [--no-start] [-t] -- cmd…`, `export <id>|--all [--push]`, `title <id> <title>`, `ls [search] [-l]
+[--closed] [--json]`, `ls --from <id>`, `daemon [--socket p] [--idle-exit s] [--fetch-every s]`.
+`ls` lists every open stew wherever it is (running, stopped, or `removed`: on no site), never
+looking into one: the daemon's state, the drivers', hc's agents, and each stew's notes branch
+as the daemon last fetched it (every minute, and after its own pushes). One line per stew
+(title, short id, site, state, agents); `-l` adds its README as it is, `--json` everything.
 `--account n` (claude only, to spread usage over subscriptions) starts claude with
 `CLAUDE_CODE_OAUTH_TOKEN` from `CLAUDE_ACCOUNT_<N>_TOKEN`, which bento's claude preset sets
 per account; its terminal is `claude-<n>-<k>`. None given: `account:` in the config, else

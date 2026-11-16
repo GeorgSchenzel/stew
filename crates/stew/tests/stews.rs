@@ -88,7 +88,7 @@ fn setup() -> T {
     );
     let stews = env.base.join("stews");
     env.write(".config/stew/config.yaml", &config(&notes, &stews, "host"));
-    let d = daemon(&env, &[]);
+    let d = daemon(&env, &["--fetch-every", "1"]);
     T {
         env,
         d,
@@ -217,12 +217,15 @@ fn new_remove_open_close() {
     assert_eq!(meta["repos"][1]["name"], "group/b");
     assert_eq!(meta["repos"][1]["branch"], "master");
 
-    // ls: live from the root, with Now lines
-    fs::write(
-        root.join("notes/README.md"),
-        "# Test it\n\nAbout.\n\n## Now\n- waiting: Georg looks\n",
-    )
-    .unwrap();
+    // ls: its site and state, and README as pushed (once the daemon has fetched it)
+    let readme = "# Test it\n\nAbout.\n\n## Now\n- waiting: Georg looks\n";
+    fs::write(root.join("notes/README.md"), readme).unwrap();
+    t.sh(&root.join("notes"), "git commit -qam now && git push -q");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while t.ls()["stews"][0]["readme"] != readme {
+        assert!(Instant::now() < deadline, "not fetched");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let v = t.ls();
     let s = &v["stews"][0];
     assert_eq!(
@@ -230,12 +233,9 @@ fn new_remove_open_close() {
         (Some(id.as_str()), Some("t"))
     );
     assert_eq!(s["state"], "running");
-    assert_eq!(s["now"][0], "waiting: Georg looks");
-    assert_eq!(s["repos"][0]["dir"], "a");
     let human = t.ok(&["ls"]).stdout;
-    assert!(human.contains("a@main  b@master"), "{human}");
-    assert!(human.contains("- waiting: Georg looks"), "{human}");
-    t.sh(&root.join("notes"), "git commit -qam now && git push -q");
+    assert!(human.starts_with("Test it  "), "{human}");
+    assert!(human.contains("  t  running"), "{human}");
 
     // exec: stdin, exit codes, the stew's env, in its root
     let r = t.stew_in(
@@ -285,7 +285,10 @@ fn new_remove_open_close() {
     assert_eq!(snap["repos"][0]["branch"], "work");
     assert_eq!(snap["repos"][1]["name"], "group/b");
     assert!(snap.get("state").is_none());
-    assert_eq!(t.ls()["stews"], serde_json::json!([]));
+    // still listed, on no site
+    let v = t.ls();
+    assert_eq!(v["stews"][0]["state"], "removed");
+    assert!(v["stews"][0].get("site").is_none());
     let r = t.stew(&["remove", &id]);
     assert!(
         r.code != 0 && r.stderr.contains("on no site"),
@@ -312,7 +315,7 @@ fn new_remove_open_close() {
         r.stderr
     );
 
-    // close: closed in stew.yaml, a LOG line, out of ls --all
+    // close: closed in stew.yaml, a LOG line, out of ls
     t.ok(&["close", &id]);
     assert!(!root2.exists());
     let snap = yaml(&t.tracked_file(&id, "stew.yaml"));
@@ -320,10 +323,10 @@ fn new_remove_open_close() {
     assert!(snap["closed"].as_str().unwrap().starts_with("20"));
     let log = t.tracked_file(&id, "LOG.md");
     assert!(log.trim_end().ends_with(" closed"), "{log}");
-    let all = t.ok(&["ls", "--all", "--json"]).stdout;
+    let all = t.ok(&["ls", "--json"]).stdout;
     assert!(!all.contains(&id), "{all}");
-    assert!(t.ok(&["ls", "--all", "--closed"]).stdout.contains(&id));
-    assert!(t.ok(&["ls", "--waiting"]).stdout.is_empty());
+    let v: Value = serde_json::from_str(&t.ok(&["ls", "--closed", "--json"]).stdout).unwrap();
+    assert_eq!(v["stews"][0]["state"], "closed");
 
     // open reopens it
     t.ok(&["open", &id]);
@@ -337,9 +340,7 @@ fn new_remove_open_close() {
         3,
         "{log}"
     );
-    assert!(t.ok(&["ls", "--all"]).stdout.contains(&id));
-    let w = t.ok(&["ls", "--waiting"]).stdout;
-    assert!(w.contains(&format!("{id}  waiting: Georg looks")), "{w}");
+    assert_eq!(t.ls()["stews"][0]["state"], "running");
     t.ok(&["remove", &id]);
 }
 
@@ -638,7 +639,6 @@ fn unreachable_sites_and_failed_creations() {
         (Some(id.as_str()), Some("unreachable"))
     );
     assert_eq!(s["title"], "Far away");
-    assert_eq!(s["repos"][0]["branch"], "main");
     let r = t.stew(&["remove", &id]);
     assert_eq!(r.code, 2, "{}", r.stderr);
     assert!(r.stderr.contains("cannot verify"), "{}", r.stderr);

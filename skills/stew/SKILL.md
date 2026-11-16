@@ -19,11 +19,12 @@ You are in a stew: a dir of writable repo clones plus `notes/`, usually in a san
   Without `--start` it waits for a human.
 - Agents in this stew: hc, see `hc --skill`. Agents in a new stew: `stew new`.
 - `stew agent <id> "<task>"`: an agent in another stew you started (e.g. a prepared one).
-- `stew ls --from .`: stews started from here, with their agents' status and Now lines.
+- `stew ls --from .`: stews started from here, with their state and agents' status
+  (`--json`: with their READMEs, as last pushed).
 - Another stew's notes: `git fetch origin stew/<id>:refs/remotes/origin/stew/<id>`,
   then `git show origin/stew/<id>:<path>`. Links look like `<id>:<path>`, `<repo>@<branch>`.
 - `notes/README.md`: a short paragraph telling someone new what this stew is and why it
-  exists, then `## Now`, where things stand. Keep it true; start a Now line with
-  `waiting:` or `blocked:` when it needs a human.
+  exists, then `## Now`, where things stand. Keep it true and push it: it is what people
+  (and `stew ls`) see of this stew. Say plainly in Now when it needs a human.
 - `notes/LOG.md`: append `- <date> <what happened>` when something worth remembering
   happens; high-level, not per commit.

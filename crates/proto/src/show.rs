@@ -3,7 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{CreationInfo, Live};
+use crate::{CreationInfo, Listed};
 
 pub fn now() -> i64 {
     SystemTime::now()
@@ -11,7 +11,7 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `text` without control characters (C0, C1, DEL) except newlines: titles, Now lines and
+/// `text` without control characters (C0, C1, DEL) except newlines: titles, READMEs and
 /// agents' status are written in stews, and an escape sequence must not reach the terminal
 /// of whoever lists them.
 pub fn printable(text: &str) -> String {
@@ -30,54 +30,58 @@ pub fn age(secs: i64) -> String {
     }
 }
 
-/// Per stew: id, title, site, state, age; then from, repos, agents and Now lines indented.
-pub fn live_table(stews: &[Live], creations: &[CreationInfo]) -> String {
+/// The short form of an id: its 4 random chars.
+pub fn short(id: &str) -> &str {
+    id.rsplit_once('-').map_or(id, |(_, s)| s)
+}
+
+/// One line per stew: title, short id, site, state, agents, age; with `long`, its README
+/// indented under it. Then a line per creation in progress or failed.
+pub fn table(stews: &[Listed], creations: &[CreationInfo], long: bool) -> String {
     let now = now();
-    let w0 = stews.iter().map(|t| t.id.len()).max().unwrap_or(0);
-    let w1 = stews
+    let rows: Vec<[String; 5]> = stews
         .iter()
-        .map(|t| t.title.chars().count())
-        .max()
-        .unwrap_or(0);
-    let w2 = stews.iter().map(|t| t.site.len()).max().unwrap_or(0);
-    let mut out = String::new();
-    for t in stews {
-        let age = if t.updated > 0 {
-            age(now - t.updated)
-        } else {
-            "?".into()
-        };
-        let head = format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<11}  {:>4}",
-            t.id, t.title, t.site, t.state, age
-        );
-        out.push_str(head.trim_end());
-        out.push('\n');
-        if let Some(f) = &t.from {
-            out.push_str(&format!("    from {f}\n"));
-        }
-        if !t.repos.is_empty() {
-            let repos: Vec<String> = t
-                .repos
+        .map(|t| {
+            let agents: Vec<String> = t
+                .agents
                 .iter()
-                .map(|r| {
-                    if r.branch.is_empty() {
-                        format!("{} (detached)", r.dir)
-                    } else {
-                        format!("{}@{}", r.dir, r.branch)
-                    }
+                .map(|a| {
+                    let name = a.address.rsplit_once('/').map_or(&*a.address, |(_, n)| n);
+                    format!("{name} {}", a.status)
                 })
                 .collect();
-            out.push_str(&format!("    {}\n", repos.join("  ")));
-        }
-        for a in &t.agents {
-            out.push_str(&format!(
-                "    agent {}  {}  {}\n",
-                a.address, a.program, a.status
-            ));
-        }
-        for line in &t.now {
-            out.push_str(&format!("    - {line}\n"));
+            let age = if t.updated > 0 {
+                age(now - t.updated)
+            } else {
+                "?".into()
+            };
+            [
+                t.title.clone(),
+                short(&t.id).to_string(),
+                t.site.clone().unwrap_or_else(|| "-".into()),
+                t.state.clone(),
+                format!("{age:>4}  {}", agents.join(", ")),
+            ]
+        })
+        .collect();
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2, w3) = (width(0), width(1), width(2), width(3));
+    let mut out = String::new();
+    for (t, r) in stews.iter().zip(&rows) {
+        let line = format!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
+            r[0], r[1], r[2], r[3], r[4]
+        );
+        out.push_str(line.trim_end());
+        out.push('\n');
+        if long {
+            for l in t.readme.lines() {
+                out.push_str(format!("    {l}").trim_end());
+                out.push('\n');
+            }
+            if !t.readme.is_empty() {
+                out.push('\n');
+            }
         }
     }
     for c in creations {

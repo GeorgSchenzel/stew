@@ -294,14 +294,10 @@ fn lists_tracked_stews() {
     assert_eq!(ids[0], old, "most recent first: {ids:?}");
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&new.as_str()));
-    assert_eq!(all[0].description, "What this is about.");
-    assert_eq!(all[0].now, ["parsing: done", "waiting: Georg picks a name"]);
-    assert_eq!(
-        all[0].waiting().collect::<Vec<_>>(),
-        ["waiting: Georg picks a name"]
-    );
+    // the README as it is, unparsed
+    assert!(all[0].readme.contains("- waiting: Georg picks a name\n"));
     let fresh = all.iter().find(|t| t.meta.id == new).unwrap();
-    assert!(fresh.description.is_empty() && fresh.now.is_empty());
+    assert_eq!(fresh.readme, "# Zoo keeper\n\n## Now\n");
     assert_eq!(all[0].updated, later as i64);
     assert_eq!(all[0].meta.title, "Old work");
     assert!(
@@ -309,11 +305,12 @@ fn lists_tracked_stews() {
         "{warnings:?}"
     );
 
-    let (closed, _) = hub.tracked(None, true).unwrap();
-    assert_eq!(closed.len(), 1);
-    assert_eq!(closed[0].meta.id, done);
-    assert!(closed[0].meta.is_closed());
-    assert_eq!(closed[0].meta.closed.as_deref(), Some("2026-11-15"));
+    // with `closed`, the closed ones too
+    let (with_closed, _) = hub.tracked(None, true).unwrap();
+    assert_eq!(with_closed.len(), 3);
+    let closed = with_closed.iter().find(|t| t.meta.id == done).unwrap();
+    assert!(closed.meta.is_closed());
+    assert_eq!(closed.meta.closed.as_deref(), Some("2026-11-15"));
 
     let search = |term| {
         let (hits, _) = hub.tracked(Some(term), false).unwrap();

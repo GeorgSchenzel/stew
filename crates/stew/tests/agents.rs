@@ -196,6 +196,7 @@ fn setup(slow_hc: bool) -> T {
 
     let mut cmd = Command::new(&exe);
     cmd.args(["daemon", "--socket", socket.to_str().unwrap()])
+        .args(["--fetch-every", "1"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -437,7 +438,9 @@ fn agents_start_stews_from_inside_one() {
     );
     let human = t.ok(&["ls"]).stdout;
     assert!(
-        human.contains(&format!("agent {child}/claude-1  standin  working")),
+        human
+            .lines()
+            .any(|l| l.starts_with("Child ") && l.ends_with("claude-1 working")),
         "{human}"
     );
     assert_eq!(
@@ -526,16 +529,14 @@ fn agents_start_stews_from_inside_one() {
     // ls --from: from inside (`.`) and from the host
     let r = t.inside(&parent, &["ls", "--from", "."], None);
     assert_eq!(r.code, 0, "{}", r.stderr);
+    // short ids (they work as targets too)
+    let short = |id: &str| id[id.len() - 4..].to_string();
     assert!(
-        r.stdout.contains(&child) && r.stdout.contains(&prepared),
+        r.stdout.contains(&short(&child)) && r.stdout.contains(&short(&prepared)),
         "{}",
         r.stdout
     );
-    assert!(
-        r.stdout.contains(&format!("agent {child}/claude-1")),
-        "{}",
-        r.stdout
-    );
+    assert!(r.stdout.contains("claude-1 working"), "{}", r.stdout);
     let r = t.ok(&["ls", "--from", &parent, "--json"]);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 2, "{v}");
@@ -597,14 +598,18 @@ fn agents_start_stews_from_inside_one() {
         false,
         "and nothing started it again"
     );
+    // still listed: on no site, no agents
     let v = t.ls();
-    assert!(
-        v["stews"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|s| s["id"] != child.as_str())
-    );
+    let c = T::live(&v, &child);
+    assert_eq!(c["state"], "removed");
+    assert!(c.get("site").is_none(), "{c}");
+    assert_eq!(c["agents"], Value::Array(vec![]));
+
+    // stop takes a stopped stew off the runtime; the host driver stops nothing, so its
+    // stews stay on it (bento's: checked on the real bento)
+    t.ok(&["stop", &parent]);
+    assert!(t.machines().contains(&parent));
+    assert_eq!(T::live(&t.ls(), &parent)["state"], "running");
 
     // start reconnects a machine that went missing
     t.hc_in(HUB, &["machine", "rm", &parent, "--json"]);
@@ -777,8 +782,7 @@ fn the_token_and_what_a_stew_may_ask() {
             id: b.clone(),
             title: "t".into(),
         },
-        Call::Ls,
-        Call::LsAll {
+        Call::Ls {
             search: None,
             closed: false,
         },
@@ -935,7 +939,6 @@ fn a_killed_client_still_gets_a_complete_stew() {
     let v = t.ls();
     let s = T::live(&v, &id);
     assert_eq!(s["state"], "running");
-    assert_eq!(s["repos"][0]["dir"], "a");
     assert_eq!(s["agents"][0]["address"], format!("{id}/claude-1"));
     assert!(v["creations"].as_array().unwrap().is_empty(), "{v}");
     t.ok(&["remove", &id]);
@@ -1071,14 +1074,14 @@ fn a_pushed_from_takes_over_no_stew() {
     assert_eq!(r.code, 2, "a spoof branch: {}", r.stderr);
     assert!(r.stderr.contains("was not started from"), "{}", r.stderr);
     // the other readers skip it too: b is not a's child, b's info is b's own
-    let r = t.inside(&a, &["ls", "--from", ".", "--json"], None);
+    // (once the daemon's next fetch has it)
+    let mut r = t.inside(&a, &["ls", "--from", ".", "--json"], None);
+    wait_for("the spoof branch fetched", 10, || {
+        r = t.inside(&a, &["ls", "--from", ".", "--json"], None);
+        r.stderr.contains("stew/zzzz-0000")
+    });
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!r.stdout.contains(&b), "{}", r.stdout);
-    assert!(
-        r.stderr.contains("stew/zzzz-0000"),
-        "a warning: {}",
-        r.stderr
-    );
     let r = t.inside(&b, &["info"], None);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!r.stdout.contains(&format!("from    {a}")), "{}", r.stdout);

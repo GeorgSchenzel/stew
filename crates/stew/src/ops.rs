@@ -2,13 +2,13 @@
 //! `exec`/`enter` run. The daemon reaches a stew only through its site's driver; all git in
 //! clones and `notes/` runs where the stew lives, through `exec` (`inspect`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
 use stew_proto::{
-    AgentInfo, CreationInfo, Here, Live, LiveRepo, Openness, Reply, RepoRecord, Resolved, StewMeta,
-    Tracked,
+    AgentInfo, CreationInfo, Here, Listed, LiveRepo, Openness, Reply, RepoRecord, Resolved,
+    StewMeta, Tracked,
 };
 
 use crate::catalog::Catalog;
@@ -22,9 +22,9 @@ use crate::mirror::{meta_yaml, parse_meta};
 use crate::runtime::{self, Runtime};
 use crate::state::{Creation, Placed, Progress};
 use crate::transcripts::{self, Exported, Transcripts};
-use crate::{agent, id, readme, refs};
+use crate::{agent, id, refs};
 
-/// How long `ls` waits for one stew before showing it unreachable.
+/// How long `info` waits for a look at its clones.
 const LS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the pushed check may take (it fetches every remote of every clone; a stalled
@@ -131,6 +131,39 @@ impl Hub {
         let (all, more) = mirror.every()?;
         warnings.extend(more);
         Ok(all)
+    }
+
+    /// The tracked stews `ls` shows, from the mirror as last fetched (the daemon fetches
+    /// in the background and after its own pushes): the open ones, with `closed` the closed
+    /// ones too; `search` keeps those whose id, title or notes contain it. A mirror that
+    /// can't be read is a warning and no rows.
+    fn mirror_cached(
+        &self,
+        config: &Config,
+        search: Option<&str>,
+        closed: bool,
+        warnings: &mut Vec<String>,
+    ) -> Vec<Tracked> {
+        let read = || {
+            let mirror = self.mirror(config)?;
+            // reads go without the lock (a fetch holding it would hold up `ls`; git
+            // updates refs atomically), only the first clone takes it
+            if !self.paths.mirror().join("HEAD").exists() {
+                let _lock = self.mirror_lock();
+                mirror.ensure()?;
+            }
+            mirror.tracked(search, closed)
+        };
+        match read() {
+            Ok((all, more)) => {
+                warnings.extend(more);
+                all
+            }
+            Err(e) => {
+                warnings.push(e.to_string());
+                vec![]
+            }
+        }
     }
 
     pub fn new_stew(&self, a: NewArgs) -> Result<Reply> {
@@ -675,6 +708,14 @@ impl Hub {
         }
         progress(&format!("{id}: stopping"));
         warnings.extend(driver.stop(&t)?);
+        // a stopped stew is off the runtime: no via retrying into a box that is off; `start`
+        // connects it again (its spaces and tabs live in its own core and come back). One
+        // still running (the host driver stops nothing) stays.
+        if !matches!(driver.state(&t), Ok(BoxState::Running))
+            && let Err(e) = runtime::for_config(&config).disconnect(id)
+        {
+            warnings.push(format!("disconnecting {id} from the runtime: {e}"));
+        }
         Ok(Reply::Done { warnings })
     }
 
@@ -726,46 +767,30 @@ impl Hub {
         Ok(launch_reply(l))
     }
 
-    pub fn ls(&self) -> Result<Reply> {
+    pub fn ls(&self, search: Option<&str>, closed: bool) -> Result<Reply> {
         let config = Config::load(&self.paths)?;
+        let mut warnings = Vec::new();
+        let tracked = self.mirror_cached(&config, search, closed, &mut warnings);
         let (placed, creations) = {
             let f = self.state.lock().unwrap_or_else(|p| p.into_inner());
             (f.state.stews.clone(), f.state.creations.clone())
         };
-        let mut warnings = Vec::new();
-        let agents = self.agents(&config, &mut warnings);
-        let tracked: BTreeMap<String, Tracked> = match self.mirror_every(&config, &mut warnings) {
-            Ok(all) => all.into_iter().map(|t| (t.meta.id.clone(), t)).collect(),
-            Err(e) => {
-                warnings.push(e.to_string());
-                BTreeMap::new()
-            }
+        // a stew on a site the mirror doesn't show (not fetched yet, or unreadable) is
+        // listed all the same, unless a search or a closed record left it out
+        let shown: BTreeSet<&str> = tracked.iter().map(|t| t.meta.id.as_str()).collect();
+        let hidden = |id: &str| {
+            search.is_some_and(|s| !s.trim().is_empty()) || self.is_tracked_closed(&config, id)
         };
-        let mut stews: Vec<Live> = std::thread::scope(|s| {
-            let jobs: Vec<_> = placed
-                .iter()
-                .map(|(id, p)| {
-                    let config = &config;
-                    let tracked = tracked.get(id);
-                    let agents = agents.get(id).cloned().unwrap_or_default();
-                    (
-                        id,
-                        p,
-                        s.spawn(move || self.live(config, id, p, tracked, agents)),
-                    )
-                })
-                .collect();
-            jobs.into_iter()
-                .map(|(id, p, j)| {
-                    // a look that panicked shows as unreachable, never as nothing
-                    j.join().unwrap_or_else(|_| {
-                        warnings.push(format!("looking at {id} failed"));
-                        from_tracked(id, tracked.get(id), &p.site, "unreachable")
-                    })
-                })
-                .collect()
-        });
-        stews.sort_by(|a, b| b.updated.cmp(&a.updated).then(a.id.cmp(&b.id)));
+        let extra: Vec<&String> = placed
+            .keys()
+            .filter(|id| !shown.contains(id.as_str()) && !hidden(id))
+            .collect();
+        let rows: Vec<(&str, Option<&Tracked>)> = tracked
+            .iter()
+            .map(|t| (t.meta.id.as_str(), Some(t)))
+            .chain(extra.iter().map(|id| (id.as_str(), None)))
+            .collect();
+        let stews = self.listed(&config, &rows, &placed, &mut warnings);
         let creations = creations
             .into_iter()
             .map(|(id, c)| CreationInfo {
@@ -778,11 +803,83 @@ impl Hub {
                 error: c.error,
             })
             .collect();
-        Ok(Reply::Live {
+        Ok(Reply::Listed {
             stews,
             creations,
             warnings,
         })
+    }
+
+    /// Whether the mirror (as last fetched) has `id` closed.
+    fn is_tracked_closed(&self, config: &Config, id: &str) -> bool {
+        let Ok(mirror) = self.mirror(config) else {
+            return false;
+        };
+        mirror
+            .every()
+            .map(|(all, _)| all.iter().any(|t| t.meta.id == id && t.meta.is_closed()))
+            .unwrap_or(false)
+    }
+
+    /// The rows for `ls`: open stews first, then closed ones, each most recent first. A
+    /// stew on a site shows its driver's state (asked in parallel, never starting it),
+    /// one on none `removed` or `closed`.
+    fn listed(
+        &self,
+        config: &Config,
+        rows: &[(&str, Option<&Tracked>)],
+        placed: &BTreeMap<String, Placed>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<Listed> {
+        let agents = self.agents(config, warnings);
+        let mut stews: Vec<Listed> = std::thread::scope(|s| {
+            let jobs: Vec<_> = rows
+                .iter()
+                .map(|&(id, t)| {
+                    let p = placed.get(id);
+                    let agents = agents.get(id).cloned().unwrap_or_default();
+                    s.spawn(move || {
+                        let mut row = listed_row(id, t, p.map(|p| p.site.as_str()));
+                        if let Some(p) = p {
+                            row.state = self.state_word(config, id, p);
+                            row.agents = agents;
+                        }
+                        row
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .zip(rows)
+                .map(|(j, &(id, t))| {
+                    // a look that panicked shows as unreachable, never as nothing
+                    j.join().unwrap_or_else(|_| {
+                        let p = placed.get(id).map(|p| p.site.as_str());
+                        let mut row = listed_row(id, t, p);
+                        row.state = "unreachable".into();
+                        row
+                    })
+                })
+                .collect()
+        });
+        stews.sort_by(|a, b| {
+            (a.state == "closed")
+                .cmp(&(b.state == "closed"))
+                .then(b.updated.cmp(&a.updated))
+                .then(a.id.cmp(&b.id))
+        });
+        stews
+    }
+
+    /// The driver's word for a stew on a site: `running`, `stopped`, ...; `unreachable`
+    /// when the driver can't say.
+    fn state_word(&self, config: &Config, id: &str, p: &Placed) -> String {
+        let Ok((_, driver)) = self.driver(config, Some(&p.site)) else {
+            return "unreachable".into();
+        };
+        match driver.state(&target(id, &p.token)) {
+            Ok(s) => s.word().to_string(),
+            Err(_) => "unreachable".into(),
+        }
     }
 
     /// The runtime's agents by stew; a runtime that can't be asked is a warning.
@@ -796,76 +893,43 @@ impl Hub {
             BTreeMap::new()
         })
     }
-
-    /// One stew for `ls`: live when it runs (never starting it), else its notes branch.
-    fn live(
-        &self,
-        config: &Config,
-        id: &str,
-        p: &Placed,
-        tracked: Option<&Tracked>,
-        agents: Vec<AgentInfo>,
-    ) -> Live {
-        let mut live = from_tracked(id, tracked, &p.site, "unreachable");
-        live.agents = agents;
-        let Ok((_, driver)) = self.driver(config, Some(&p.site)) else {
-            return live;
-        };
-        let t = target(id, &p.token);
-        let state = match driver.state(&t) {
-            Ok(s) => s,
-            Err(_) => return live,
-        };
-        live.state = state.word().to_string();
-        if state != BoxState::Running {
-            return live;
-        }
-        match inspect::look(driver.as_ref(), &t, Mode::Ls, true, Some(LS_TIMEOUT)) {
-            Ok(Looked::Look(l)) => {
-                live.repos = l
-                    .repos
-                    .iter()
-                    .map(|f| LiveRepo {
-                        dir: f.dir.clone(),
-                        branch: f.branch.clone(),
-                    })
-                    .collect();
-                if let Some(m) = l.meta.as_deref().and_then(|m| parse_meta(m).ok()) {
-                    live.title = m.title;
-                    live.from = m.from;
-                }
-                if let Some(r) = &l.readme {
-                    live.now = readme::summarize(r).now;
-                }
-            }
-            Ok(Looked::NotRunning) => live.state = "stopped".into(),
-            Err(_) => live.state = "unreachable".into(),
-        }
-        live
-    }
 }
 
 impl Hub {
-    /// The caller's own stew, live.
+    /// The caller's own stew: its row, and its clones looked at live.
     pub fn info(&self, id: &str) -> Result<Reply> {
         let config = Config::load(&self.paths)?;
         let (placed, driver) = self.placed(&config, id)?;
         let mut warnings = Vec::new();
-        let agents = self.agents(&config, &mut warnings);
         let tracked = self
-            .mirror_every(&config, &mut warnings)
-            .ok()
-            .and_then(|all| all.into_iter().find(|t| t.meta.id == id));
-        let stew = self.live(
-            &config,
-            id,
-            &placed,
-            tracked.as_ref(),
-            agents.get(id).cloned().unwrap_or_default(),
-        );
-        let root = driver.root(&target(id, &placed.token))?;
+            .mirror_cached(&config, None, true, &mut warnings)
+            .into_iter()
+            .find(|t| t.meta.id == id);
+        let stew = self
+            .listed(
+                &config,
+                &[(id, tracked.as_ref())],
+                &BTreeMap::from([(id.to_string(), placed.clone())]),
+                &mut warnings,
+            )
+            .pop()
+            .ok_or_else(|| fail!("stew {id} is not listed"))?;
+        let t = target(id, &placed.token);
+        let repos = match inspect::look(driver.as_ref(), &t, Mode::Ls, true, Some(LS_TIMEOUT)) {
+            Ok(Looked::Look(l)) => l
+                .repos
+                .iter()
+                .map(|f| LiveRepo {
+                    dir: f.dir.clone(),
+                    branch: f.branch.clone(),
+                })
+                .collect(),
+            _ => vec![],
+        };
+        let root = driver.root(&t)?;
         Ok(Reply::Info {
             stew,
+            repos,
             driver: placed_driver_word(&config, &placed.site),
             root,
         })
@@ -949,12 +1013,11 @@ impl Hub {
         }
     }
 
-    /// The tracked stews started from `id`, open and closed, live where they exist.
+    /// The tracked stews started from `id`, open and closed.
     pub fn ls_from(&self, id: &str) -> Result<Reply> {
         id::check(id)?;
         let config = Config::load(&self.paths)?;
         let mut warnings = Vec::new();
-        let agents = self.agents(&config, &mut warnings);
         let placed = self
             .state
             .lock()
@@ -962,44 +1025,17 @@ impl Hub {
             .state
             .stews
             .clone();
-        let mut children: Vec<Tracked> = self
-            .mirror_every(&config, &mut warnings)?
+        let children: Vec<Tracked> = self
+            .mirror_cached(&config, None, true, &mut warnings)
             .into_iter()
             .filter(|t| t.meta.from.as_deref() == Some(id))
             .collect();
-        children.sort_by_key(|t| std::cmp::Reverse(t.updated));
-        let stews = std::thread::scope(|s| {
-            let jobs: Vec<_> = children
-                .iter()
-                .map(|t| {
-                    let config = &config;
-                    let p = placed.get(&t.meta.id);
-                    let agents = agents.get(&t.meta.id).cloned().unwrap_or_default();
-                    let site = p.map(|p| p.site.clone()).unwrap_or_default();
-                    let job = s.spawn(move || match p {
-                        Some(p) => self.live(config, &t.meta.id, p, Some(t), agents),
-                        None => {
-                            let word = if t.meta.is_closed() {
-                                "closed"
-                            } else {
-                                "removed"
-                            };
-                            from_tracked(&t.meta.id, Some(t), "", word)
-                        }
-                    });
-                    (t, site, job)
-                })
-                .collect();
-            jobs.into_iter()
-                .map(|(t, site, j)| {
-                    j.join().unwrap_or_else(|_| {
-                        warnings.push(format!("looking at {} failed", t.meta.id));
-                        from_tracked(&t.meta.id, Some(t), &site, "unreachable")
-                    })
-                })
-                .collect()
-        });
-        Ok(Reply::Live {
+        let rows: Vec<(&str, Option<&Tracked>)> = children
+            .iter()
+            .map(|t| (t.meta.id.as_str(), Some(t)))
+            .collect();
+        let stews = self.listed(&config, &rows, &placed, &mut warnings);
+        Ok(Reply::Listed {
             stews,
             creations: vec![],
             warnings,
@@ -1149,27 +1185,22 @@ impl Hub {
 }
 
 /// A stew as its notes branch has it (the state a word for where it is).
-fn from_tracked(id: &str, tracked: Option<&Tracked>, site: &str, state: &str) -> Live {
-    Live {
+/// A stew's row from its tracking record: on `site`, or else `removed`/`closed`.
+fn listed_row(id: &str, tracked: Option<&Tracked>, site: Option<&str>) -> Listed {
+    let closed = tracked.filter(|t| t.meta.is_closed());
+    Listed {
         id: id.to_string(),
         title: tracked.map(|t| t.meta.title.clone()).unwrap_or_default(),
         from: tracked.and_then(|t| t.meta.from.clone()),
-        site: site.to_string(),
-        state: state.into(),
-        repos: tracked
-            .map(|t| {
-                t.meta
-                    .repos
-                    .iter()
-                    .map(|r| LiveRepo {
-                        dir: r.name.rsplit('/').next().unwrap_or(&r.name).to_string(),
-                        branch: r.branch.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        now: tracked.map(|t| t.now.clone()).unwrap_or_default(),
+        site: site.map(String::from),
+        state: match (site, closed) {
+            (Some(_), _) => "unreachable".into(),
+            (None, Some(_)) => "closed".into(),
+            (None, None) => "removed".into(),
+        },
+        closed: closed.and_then(|t| t.meta.closed.clone()),
         updated: tracked.map_or(0, |t| t.updated),
+        readme: tracked.map(|t| t.readme.clone()).unwrap_or_default(),
         agents: vec![],
     }
 }
