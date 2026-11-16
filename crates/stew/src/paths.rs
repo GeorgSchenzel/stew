@@ -91,6 +91,11 @@ impl Paths {
         self.data.join("skills")
     }
 
+    /// The hub's checkout of the skills repo.
+    pub fn skills_repo(&self) -> PathBuf {
+        self.data.join("skills-repo")
+    }
+
     /// `~/x` → `$HOME/x`; anything else as given.
     pub fn expand(&self, p: &str) -> PathBuf {
         match p.strip_prefix("~/") {

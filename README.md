@@ -25,9 +25,13 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
   `<id>/<agent>-<session>.json[l]` plus `.meta.json`; on `stop`, `remove` (fail-closed) and
   hourly (`stew export --all`), committed daily or at once on `stop`/`remove`/`--push`.
 - `skills/`: the stew skill (`stew skill` prints it) and hc's stub; `stew skills` assembles
-  `~/.local/share/stew/skills/` with exactly these two (no workflow skills), the package
-  carries them in `share/stew/skills`, and `services.stew.hostSkills.enable` links them into
-  the host's `~/.claude/skills/` and `~/.config/opencode/skills/` (off by default).
+  `~/.local/share/stew/skills/` from these two and the skills of your skills repo (`skills:
+  <remote>` in config.yaml: each top-level dir with a `SKILL.md`, copied whole, links left
+  out; the hub keeps a shallow checkout in `~/.local/share/stew/skills-repo` and fetches it
+  on each `stew skills`, hourly). Boxes get the dir copied in at each boot (never mounted).
+  The package carries stew's two in `share/stew/skills`, and
+  `services.stew.hostSkills.enable` links them into the host's `~/.claude/skills/` and
+  `~/.config/opencode/skills/` (off by default).
 
 Development (no cargo on the host): `nix develop --no-pure-eval -c just test`, and
 `just check` for fmt and clippy. The dev shell has hc; the runtime tests run their own hub
@@ -65,14 +69,14 @@ module and refuses profile paths in them. With bento's module imported, `service
 (off by default: bento's builder must be able to fetch the flake) adds stew's parts to `programs.bento.settings`: the `stew` channel to
 `%t/stew/box.sock` (`bento.hubSocket`, default `/run/user/1000/stew/box.sock`), the tools
 `stew` (`#stew-box`) and `hc` (`#herdr-core`) from `bento.flake` (this flake at its rev), the
-skills dir at `~/.claude/skills` and `~/.config/opencode/skills`, and `STEW_HUB`.
+skills dir copied (at each boot) to `~/.claude/skills` and `~/.config/opencode/skills`, and `STEW_HUB`.
 
 claude-code is unfree, and it is in the default `agentPackages`: `services.stew.enable`
 fails evaluation unless your pkgs allow it (`nixpkgs.config.allowUnfree = true`, or an
 `allowUnfreePredicate` that accepts `claude-code`). Without unfree, set `agentPackages`
 yourself and leave it out.
 
-Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `scan: <dir>|false`, `agent:`,
+Config: `~/.config/stew/config.yaml` (`artifacts: <remote>`, `transcripts: <remote>`, `skills: <remote>`, `scan: <dir>|false`, `agent:`,
 `model:`, `account:`, `runtime: hc|none`, ...),
 the catalog in `~/.config/stew/repos.yaml` (nested groups; a string is a remote).
 State: `~/.local/state/stew/state.json`; the artifacts mirror:

@@ -171,8 +171,9 @@ in
               stew = "${cfg.bento.flake}#stew-box";
               hc = "${cfg.bento.flake}#herdr-core";
             };
-            # one dir (the hub assembles it, `stew skills`), read-only in both agents' dirs
-            files = [
+            # one dir (the hub assembles it, `stew skills`), copied into both agents' dirs at
+            # each boot: no host mount (a box sees a change at its next start)
+            copy = [
               {
                 guest = "~/.claude/skills";
                 host = skills;

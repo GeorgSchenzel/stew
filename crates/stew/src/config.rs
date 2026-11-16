@@ -16,6 +16,8 @@ pub struct Config {
     pub artifacts: Option<String>,
     /// The transcripts repo.
     pub transcripts: Option<String>,
+    /// Georg's skills repo: its top-level dirs with a `SKILL.md` go into boxes' skills.
+    pub skills: Option<String>,
     /// The site new stews go to.
     pub site: Option<String>,
     /// Clones whose `origin` joins the catalog: a dir, or `false`. Default

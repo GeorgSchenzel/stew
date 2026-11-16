@@ -234,10 +234,25 @@ impl Hub {
                 self.ls_from(&id)
             }
             Call::Skills => {
-                // one assembly at a time (they share the temporary file names)
+                // one assembly at a time (they share the temporary names)
                 let _lock = self.mirror_lock();
-                crate::skills::assemble(&self.paths.skills())?;
-                Ok(Reply::Done { warnings: vec![] })
+                let mut warnings = Vec::new();
+                let repo = match config.skills.as_deref() {
+                    Some(remote) => {
+                        let checkout = self.paths.skills_repo();
+                        let remote = crate::url::normalize(remote)?;
+                        if let Err(e) = crate::skills::update_repo(&checkout, &remote) {
+                            warnings.push(format!("{e} (using the last fetched state)"));
+                        }
+                        checkout.join(".git").is_dir().then_some(checkout)
+                    }
+                    None => None,
+                };
+                warnings.extend(crate::skills::assemble(
+                    &self.paths.skills(),
+                    repo.as_deref(),
+                )?);
+                Ok(Reply::Done { warnings })
             }
             Call::Open { id, site } => {
                 self.open_stew(&self.full_id(&config, &id)?, site.as_deref())

@@ -130,8 +130,10 @@
             assert bento.env == { STEW_HUB = "unix:/run/bento/stew.sock"; };
             assert lib.hasSuffix "#stew-box" bento.tools.stew;
             assert lib.hasSuffix "#herdr-core" bento.tools.hc;
+            # copied at each boot, never mounted
+            assert !(bento ? files);
             assert
-              bento.files == [
+              bento.copy == [
                 {
                   guest = "~/.claude/skills";
                   host = skillsDir;
