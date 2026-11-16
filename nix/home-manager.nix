@@ -111,9 +111,9 @@ in
       };
     };
     idleExit = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 600;
-      description = "Seconds without a request after which the daemon exits.";
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      description = "Seconds without a request after which the daemon exits; null: it stays up.";
     };
   };
 

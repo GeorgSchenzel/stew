@@ -13,7 +13,7 @@
   hc,
   git ? pkgs.git,
   packages ? [ ],
-  idleExit ? 600,
+  idleExit ? null,
 }:
 let
   path = lib.makeBinPath (
@@ -57,14 +57,20 @@ in
       Requires = [ "stew.socket" ];
       After = [ "stew.socket" ];
     };
-    # what the daemon starts outlives it: a box's VM (bento detaches it from the session,
-    # not from this unit's cgroup) and a host stew's hc core. With the default
-    # control-group, its idle exit (or a restart, as at a switch) killed every box it started.
+    # always on from login (and socket-activated, so a call before that starts it too); an
+    # idle exit only with `idleExit` set. What the daemon starts outlives it: a box's VM
+    # (bento detaches it from the session, not from this unit's cgroup) and a host stew's
+    # hc core. With the default control-group, an exit or a restart (as at a switch)
+    # killed every box it had started.
     Service = {
-      ExecStart = "${lib.getExe stew} daemon --idle-exit ${toString idleExit}";
+      ExecStart =
+        "${lib.getExe stew} daemon"
+        + lib.optionalString (idleExit != null) " --idle-exit ${toString idleExit}";
       Environment = env;
       KillMode = "process";
+      Restart = "on-failure";
     };
+    Install.WantedBy = [ "default.target" ];
   };
 
   # the hub's hc core, hc's default session (the one herdr-app and plain `hc` use): always

@@ -48,7 +48,7 @@ Sites (`sites:` in config.yaml; default `desktop: {driver: bento}`, `desktop-hos
 host}`; `site:` picks the default): `{driver: bento, via: ssh mac}`, `{driver: host, root:
 ~/projects/stews}`.
 
-Units: `stew.socket` and `stew.service` (socket activation, idle exit), `stew-hc.service`
+Units: `stew.socket` and `stew.service` (always on from login, socket-activated too; `services.stew.idleExit` brings back an idle exit), `stew-hc.service`
 (the hub's hc core, always on) and `stew-hourly.timer` (`stew export --all`, then `stew
 skills`), from `nix/units.nix`, installed by the home-manager module
 (`homeManagerModules.default` = `.stew`, `services.stew.enable = true`, which also installs
