@@ -4,7 +4,7 @@
 //! with a brief) with
 //! `commit-tree`, without a checkout, and pushes it only if the branch doesn't exist yet
 //! (`--force-with-lease=<ref>:`). A rejected push means the id is taken: retry with new
-//! random chars. A creation that fails later leaves the branch as its record.
+//! random chars, as for an id whose short form (its random part) another stew has. A creation that fails later leaves the branch as its record.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -86,11 +86,21 @@ impl Mirror {
         mut next_id: impl FnMut() -> Result<String>,
     ) -> Result<String> {
         self.ensure()?;
+        // the short forms in use, as fresh as can be (a failed fetch fails the push below
+        // too, or the push decides)
+        let _ = self.fetch();
+        let taken: BTreeSet<String> = self
+            .ids()?
+            .iter()
+            .map(|i| id::suffix(i).to_string())
+            .collect();
         for _ in 0..CLAIM_ATTEMPTS {
             let id = next_id()?;
             id::check(&id)?;
             let refname = branch(&id);
-            if git_ok(&self.dir, ["rev-parse", "--verify", "--quiet", &refname]) {
+            if taken.contains(id::suffix(&id))
+                || git_ok(&self.dir, ["rev-parse", "--verify", "--quiet", &refname])
+            {
                 continue;
             }
             let meta = StewMeta {
@@ -217,6 +227,19 @@ impl Mirror {
             out.retain(|t| hit(t) || in_notes.contains(&t.meta.id));
         }
         Ok((out, warnings))
+    }
+
+    /// The ids of every `stew/*` branch the mirror has (no fetch).
+    pub fn ids(&self) -> Result<Vec<String>> {
+        let out = git(
+            &self.dir,
+            [
+                "for-each-ref",
+                "--format=%(refname:lstrip=3)",
+                "refs/heads/stew/",
+            ],
+        )?;
+        Ok(out.lines().map(String::from).collect())
     }
 
     /// Every tracked stew, open or closed, most recent first.

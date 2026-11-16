@@ -229,14 +229,17 @@ fn call(call: Call) -> Result<Reply, Failure> {
     let req = Request {
         stew: Some(stew.id),
         token: env::var("STEW_TOKEN").ok().filter(|t| !t.is_empty()),
+        progress: true,
         call,
     };
-    let reply = stew_proto::call(&socket, &req).map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidInput => (1, e.to_string()),
-        _ => (
-            1,
-            format!("cannot reach the stew hub at {}: {e}", socket.display()),
-        ),
+    let reply = stew_proto::call_with(&socket, &req, |l| eprintln!("stew: {l}")).map_err(|e| {
+        match e.kind() {
+            std::io::ErrorKind::InvalidInput => (1, e.to_string()),
+            _ => (
+                1,
+                format!("cannot reach the stew hub at {}: {e}", socket.display()),
+            ),
+        }
     })?;
     match reply {
         Reply::Error { kind, message } => {

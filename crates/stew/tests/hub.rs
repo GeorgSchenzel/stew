@@ -183,6 +183,15 @@ fn claims_a_branch_and_retries_a_clash() {
         "x-cccc"
     );
 
+    // another title with a short form in use (`aaaa`): skipped, so short forms stay unique
+    let mut ids = ["y-aaaa", "y-dddd"].into_iter();
+    assert_eq!(
+        other
+            .claim_with(&meta("y"), None, || Ok(ids.next().unwrap().into()))
+            .unwrap(),
+        "y-dddd"
+    );
+
     // always taken: gives up
     let e = other
         .claim_with(&meta("x"), None, || Ok("x-aaaa".into()))

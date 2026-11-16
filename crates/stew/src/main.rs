@@ -492,12 +492,18 @@ fn read_brief(file: &str) -> Result<String> {
 /// One request to the daemon; its error replies become errors.
 fn call(paths: &Paths, call: Call) -> Result<Reply> {
     let socket = paths.socket();
-    let reply = stew_proto::call(&socket, &Request::new(call)).map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidInput => Error::Fail(e.to_string()),
-        _ => Error::Fail(format!(
-            "cannot reach the stew daemon at {}: {e}",
-            socket.display()
-        )),
+    let req = Request {
+        progress: true,
+        ..Request::new(call)
+    };
+    let reply = stew_proto::call_with(&socket, &req, |l| eprintln!("stew: {l}")).map_err(|e| {
+        match e.kind() {
+            std::io::ErrorKind::InvalidInput => Error::Fail(e.to_string()),
+            _ => Error::Fail(format!(
+                "cannot reach the stew daemon at {}: {e}",
+                socket.display()
+            )),
+        }
     })?;
     match reply {
         Reply::Error { kind, message } => Err(Error::from_reply(kind, message)),

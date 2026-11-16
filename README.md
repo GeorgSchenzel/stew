@@ -39,6 +39,10 @@ Commands: `stew new [repos…] --title t [--site s] [--branch[=name]] [--base b]
 [--site s]`, `remove|close <id> [--force]`, `start <id>|--all`, `stop <id>`, `enter <id>`,
 `exec <id> [--no-start] [-t] -- cmd…`, `export <id>|--all [--push]`, `title <id> <title>`, `ls [--json]`, `ls --all
 [search] [--closed]`, `ls --waiting`, `ls --from <id>`, `daemon [--socket p] [--idle-exit s]`.
+Wherever a command takes an `<id>`, its short form works too: the four random chars at
+its end (`k3fq` for `port-forwarding-k3fq`), unique among tracked stews (a claim skips a
+short form in use). Long commands print their steps on stderr (`stew: <id>: …`; the
+protocol's `Progress` lines, which the daemon also logs).
 
 Sites (`sites:` in config.yaml; default `desktop: {driver: bento}`, `desktop-host: {driver:
 host}`; `site:` picks the default): `{driver: bento, via: ssh mac}`, `{driver: host, root:

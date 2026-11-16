@@ -434,7 +434,21 @@ fn branch_base_title_stop_start() {
     let meta = yaml(&t.tracked_file(&id, "stew.yaml"));
     assert_eq!(meta["repos"][0]["branch"], "feature-work");
     assert_eq!(meta["title"], "A better title");
-    t.ok(&["start", &id]);
+    // its short form names it, with the steps on stderr
+    let short = id.rsplit_once('-').unwrap().1;
+    let r = t.ok(&["start", short]);
+    assert!(
+        r.stderr.contains(&format!("stew: {id}: starting on")),
+        "{}",
+        r.stderr
+    );
+    t.ok(&["exec", short, "--", "true"]);
+    let r = t.stew(&["start", "zzzz"]);
+    assert!(
+        r.code != 0 && r.stderr.contains("no stew zzzz"),
+        "{}",
+        r.stderr
+    );
     t.ok(&["start", "--all"]);
     for i in [&id, &id2, &id3.to_string()] {
         t.ok(&["remove", "--force", i]);

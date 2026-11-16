@@ -45,6 +45,20 @@ pub fn new_id(title: &str) -> Result<String> {
     Ok(format!("{}-{suffix}", slug(title)))
 }
 
+/// An id's random part, its short form (`k3fq`); no two tracked stews share one.
+pub fn suffix(id: &str) -> &str {
+    id.rsplit_once('-').map_or(id, |(_, s)| s)
+}
+
+/// A caller's argument that names a stew by its short form: four lowercase letters or
+/// digits (a full id always has a dash).
+pub fn is_short(arg: &str) -> bool {
+    arg.len() == 4
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 /// Checks an id given by a caller (it becomes a branch, a dir and an hc machine name).
 pub fn check(id: &str) -> Result<()> {
     let ok = !id.is_empty()
@@ -150,6 +164,16 @@ mod tests {
             assert!(check(bad).is_err(), "{bad}");
         }
         check("t1-abcd").unwrap();
+    }
+
+    #[test]
+    fn short_forms() {
+        assert_eq!(suffix("port-forwarding-k3fq"), "k3fq");
+        assert_eq!(suffix(&new_id("x y").unwrap()).len(), 4);
+        assert!(is_short("k3fq"));
+        for no in ["k3f", "k3fqx", "K3FQ", "x-k3", "t-ehzh"] {
+            assert!(!is_short(no), "{no}");
+        }
     }
 
     #[test]

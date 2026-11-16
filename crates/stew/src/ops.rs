@@ -13,7 +13,7 @@ use stew_proto::{
 
 use crate::catalog::Catalog;
 use crate::config::Config;
-use crate::daemon::Hub;
+use crate::daemon::{Hub, progress};
 use crate::driver::{self, BoxState, Driver, ExecOpts, Target};
 use crate::error::{Error, Result, fail};
 use crate::git::git;
@@ -202,6 +202,7 @@ impl Hub {
             let _lock = self.mirror_lock();
             mirror.claim(&meta, a.brief.as_deref())?
         };
+        progress(&format!("{id}: claimed stew/{id}"));
         let token = id::token()?;
         self.create(
             &id,
@@ -219,6 +220,7 @@ impl Hub {
         let agent = match launch {
             None => None,
             Some((name, argv)) => {
+                progress(&format!("{id}: starting {name} on the brief"));
                 let t = target(&id, &token);
                 let address = driver
                     .root(&t)
@@ -334,6 +336,7 @@ impl Hub {
             );
         })?;
         let t = target(id, token);
+        progress(&format!("{id}: creating it on {site}"));
         // what create refuses (e.g. a box of that name exists) was not made here: keep it
         if let Err(e) = driver.create(&t) {
             self.fail_creation(id, &e.to_string());
@@ -349,6 +352,8 @@ impl Hub {
                 args.extend([r.dir.clone(), r.remote.clone(), r.branch.clone()]);
             }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let dirs: Vec<&str> = resolved.iter().map(|r| r.dir.as_str()).collect();
+            progress(format!("{id}: cloning notes {}", dirs.join(" ")).trim_end());
             let out = driver.exec(
                 &t,
                 &inspect::sh(inspect::CLONE, &args),
@@ -380,8 +385,12 @@ impl Hub {
                 }
             };
             w.extend(if pending {
+                progress(&format!(
+                    "{id}: restarting (its clones' ports apply at boot)"
+                ));
                 driver.restart(&t)?
             } else {
+                progress(&format!("{id}: starting"));
                 driver.start(&t)?
             });
             Ok(w)
@@ -439,12 +448,14 @@ impl Hub {
         let rt = runtime::for_config(&config);
 
         // a first check: a refusal here changes nothing
+        progress(&format!("{id}: checking that everything is pushed"));
         let look = verify(driver.as_ref(), &t, force, "", &mut warnings)?;
         let undo = |warnings: &mut Vec<String>, e: Error| -> Error {
             connect(rt.as_ref(), driver.as_ref(), id, warnings);
             e
         };
         // its agents stop, so nothing in the runtime writes into it from here on
+        progress(&format!("{id}: stopping its agents"));
         if let Err(e) = disconnect(rt.as_ref(), driver.as_ref(), &t, &mut warnings) {
             if !force {
                 return Err(undo(
@@ -459,6 +470,7 @@ impl Hub {
 
         // its sessions, now that its agents are stopped (fail-closed like the check: what
         // isn't exported is lost with it)
+        progress(&format!("{id}: exporting its sessions"));
         match self.export_sessions(&config, driver.as_ref(), &t, false, &mut warnings) {
             Ok(()) => self.publish(&config, true, &mut warnings),
             Err(e) if force => warnings.push(format!("sessions not exported (--force): {e}")),
@@ -476,6 +488,7 @@ impl Hub {
         // finishing as it stopped, a shell still open) is not lost silently
         let look = match look {
             Some(first) => {
+                progress(&format!("{id}: checking again"));
                 let again = verify(
                     driver.as_ref(),
                     &t,
@@ -517,6 +530,7 @@ impl Hub {
             None if close => warnings.push(format!("{id} is not marked closed: no snapshot")),
             None => {}
         }
+        progress(&format!("{id}: removing it from {}", placed.site));
         driver.remove(&t, force)?;
         self.save_state(|s| {
             s.stews.remove(id);
@@ -598,6 +612,7 @@ impl Hub {
             let res = (|| {
                 let (placed, driver) = self.placed(&config, i)?;
                 let _busy = self.busy(i)?;
+                progress(&format!("{i}: starting on {}", placed.site));
                 let mut w = driver.start(&target(i, &placed.token))?;
                 connect(
                     runtime::for_config(&config).as_ref(),
@@ -626,6 +641,7 @@ impl Hub {
         let t = target(id, &placed.token);
         let mut warnings = Vec::new();
         // a stopped stew changed nothing since its last stop: nothing to snapshot
+        progress(&format!("{id}: checking what is pushed"));
         match inspect::look(driver.as_ref(), &t, Mode::Check, true, Some(CHECK_TIMEOUT)) {
             Ok(Looked::NotRunning) => {}
             Ok(Looked::Look(l)) => {
@@ -637,6 +653,9 @@ impl Hub {
                     ));
                 }
                 // its sessions, before it stops
+                progress(&format!(
+                    "{id}: exporting its sessions, writing the snapshot"
+                ));
                 if let Err(e) =
                     self.export_sessions(&config, driver.as_ref(), &t, true, &mut warnings)
                 {
@@ -651,6 +670,7 @@ impl Hub {
             }
             Err(e) => warnings.push(format!("no snapshot: {e}")),
         }
+        progress(&format!("{id}: stopping"));
         warnings.extend(driver.stop(&t)?);
         Ok(Reply::Done { warnings })
     }
@@ -878,9 +898,11 @@ impl Hub {
             // starting and connecting are one command at a time; `hc run` is not (hc names
             // concurrent agents apart), so two agents can start in one stew at once
             let _busy = self.busy(id)?;
+            progress(&format!("{id}: starting (when stopped) and connecting"));
             warnings.extend(driver.start(&t)?);
             rt.connect(id, &runtime::via(id), &driver.root(&t)?)?;
         }
+        progress(&format!("{id}: starting {agent}"));
         let address = rt.run(id, &agent, &argv, &driver.root(&t)?)?;
         Ok(Reply::Started { address, warnings })
     }
@@ -1168,6 +1190,7 @@ fn launch_reply(l: driver::Launch) -> Reply {
 
 /// Connects a stew to the runtime; a failure is a warning (`stew start` connects again).
 fn connect(rt: &dyn Runtime, driver: &dyn Driver, id: &str, warnings: &mut Vec<String>) {
+    progress(&format!("{id}: connecting it to the agent runtime (hc)"));
     let res = driver
         .root(&Target {
             id: id.into(),

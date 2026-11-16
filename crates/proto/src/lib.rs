@@ -1,7 +1,8 @@
 //! The protocol between stew clients (the host CLI, the in-box client) and the hub daemon.
 //!
 //! JSON lines over a unix socket: the client sends one `Request` line and reads `Reply`
-//! lines until it has its answer, then closes. Nobody half-closes (a guest `SHUT_WR` can
+//! lines until it has its answer (with `progress`, `Reply::Progress` lines come first),
+//! then closes. Nobody half-closes (a guest `SHUT_WR` can
 //! truncate buffered data on a channel), so a message ends at its newline, never at EOF.
 
 use std::io::{self, BufRead, BufReader, Write};
@@ -35,6 +36,9 @@ pub struct Request {
     /// The stew's token (`STEW_TOKEN`), issued by the daemon at `new`/`open`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The client shows what the daemon is doing: `Reply::Progress` lines before the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub progress: bool,
     #[serde(flatten)]
     pub call: Call,
 }
@@ -44,6 +48,7 @@ impl Request {
         Request {
             stew: None,
             token: None,
+            progress: false,
             call,
         }
     }
@@ -257,6 +262,10 @@ pub enum Reply {
         kind: ErrorKind,
         message: String,
     },
+    /// A step the daemon is on, before the answer (only when the request asked for them).
+    Progress {
+        line: String,
+    },
 }
 
 /// A stew that exists on a site, as `stew ls` shows it.
@@ -434,6 +443,15 @@ pub fn hub_socket(hub: &str) -> Result<std::path::PathBuf, String> {
 
 /// Sends `req` to the daemon at `socket` and returns its reply.
 pub fn call(socket: &Path, req: &Request) -> io::Result<Reply> {
+    call_with(socket, req, |_| {})
+}
+
+/// `call`, handing each `Reply::Progress` line to `progress` as it comes.
+pub fn call_with(
+    socket: &Path,
+    req: &Request,
+    mut progress: impl FnMut(&str),
+) -> io::Result<Reply> {
     // the daemon reads at most MAX_REQUEST: say so here instead of a cut-off line there
     // (JSON escapes control characters, so a brief under MAX_BRIEF can still be too long)
     let mut line = serde_json::to_vec(req)?;
@@ -446,12 +464,19 @@ pub fn call(socket: &Path, req: &Request) -> io::Result<Reply> {
     }
     let stream = UnixStream::connect(socket)?;
     (&stream).write_all(&line)?;
-    recv(&mut BufReader::new(&stream))?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the daemon closed the connection without a reply",
-        )
-    })
+    let mut r = BufReader::new(&stream);
+    loop {
+        match recv(&mut r)? {
+            Some(Reply::Progress { line }) => progress(&line),
+            Some(reply) => return Ok(reply),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the daemon closed the connection without a reply",
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

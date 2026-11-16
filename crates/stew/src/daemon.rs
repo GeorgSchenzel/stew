@@ -10,6 +10,7 @@
 //! fd 3, the stews' at fd 4) and, with `--idle-exit`, exits when no request has come for that
 //! long and nothing is in progress.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -209,13 +210,22 @@ impl Hub {
                 agent,
                 model,
                 task,
-            } => self.agent(&id, agent.as_deref(), model.as_deref(), &task, caller),
-            Call::Attach { agent } => self.attach(&agent),
+            } => self.agent(
+                &self.full_id(&config, &id)?,
+                agent.as_deref(),
+                model.as_deref(),
+                &task,
+                caller,
+            ),
+            Call::Attach { agent } => match agent.split_once('/') {
+                Some((id, name)) => self.attach(&format!("{}/{name}", self.full_id(&config, id)?)),
+                None => self.attach(&agent),
+            },
             Call::LsFrom { id } => {
                 let id = match (id.as_str(), caller) {
                     (".", Some(c)) => c.to_string(),
                     (".", None) => return Err(fail!("`--from .` needs a stew (run it in one)")),
-                    (i, _) => i.to_string(),
+                    (i, _) => self.full_id(&config, i)?,
                 };
                 self.ls_from(&id)
             }
@@ -225,20 +235,28 @@ impl Hub {
                 crate::skills::assemble(&self.paths.skills())?;
                 Ok(Reply::Done { warnings: vec![] })
             }
-            Call::Open { id, site } => self.open_stew(&id, site.as_deref()),
-            Call::Remove { id, force } => self.remove(&id, force, false),
-            Call::Close { id, force } => self.remove(&id, force, true),
-            Call::Start { id } => self.start(id.as_deref()),
-            Call::Stop { id } => self.stop(&id),
-            Call::Title { id, title } => self.title(&id, &title),
+            Call::Open { id, site } => {
+                self.open_stew(&self.full_id(&config, &id)?, site.as_deref())
+            }
+            Call::Remove { id, force } => self.remove(&self.full_id(&config, &id)?, force, false),
+            Call::Close { id, force } => self.remove(&self.full_id(&config, &id)?, force, true),
+            Call::Start { id } => {
+                let id = id.map(|i| self.full_id(&config, &i)).transpose()?;
+                self.start(id.as_deref())
+            }
+            Call::Stop { id } => self.stop(&self.full_id(&config, &id)?),
+            Call::Title { id, title } => self.title(&self.full_id(&config, &id)?, &title),
             Call::Ls => self.ls(),
-            Call::Export { id, push } => self.export(id.as_deref(), push),
+            Call::Export { id, push } => {
+                let id = id.map(|i| self.full_id(&config, &i)).transpose()?;
+                self.export(id.as_deref(), push)
+            }
             Call::Where {
                 id,
                 argv,
                 no_start,
                 tty,
-            } => self.launch(&id, &argv, no_start, tty),
+            } => self.launch(&self.full_id(&config, &id)?, &argv, no_start, tty),
             Call::LsAll { search, closed } => {
                 let mirror = self.mirror(&config)?;
                 let _lock = self.mirror_lock();
@@ -252,6 +270,41 @@ impl Hub {
                 warnings.extend(more);
                 Ok(Reply::Tracked { stews, warnings })
             }
+        }
+    }
+
+    /// The stew a caller's argument names: a full id as given, or a short form (`k3fq`)
+    /// as the one stew whose id ends in it, a stew on a site first, else a tracked one
+    /// (the mirror as last fetched).
+    fn full_id(&self, config: &Config, arg: &str) -> Result<String> {
+        if !crate::id::is_short(arg) {
+            return Ok(arg.to_string());
+        }
+        let ends = |i: &String| crate::id::suffix(i) == arg;
+        let placed: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .state
+            .stews
+            .keys()
+            .filter(|i| ends(i))
+            .cloned()
+            .collect();
+        let found = if placed.is_empty() {
+            let mirror = self.mirror(config)?;
+            let _lock = self.mirror_lock();
+            mirror.ensure()?;
+            mirror.ids()?.into_iter().filter(ends).collect()
+        } else {
+            placed
+        };
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(fail!(
+                "no stew {arg} (no id ends in -{arg}; `stew ls --all` lists them)"
+            )),
+            many => Err(fail!("{arg} names several stews: {}", many.join(", "))),
         }
     }
 
@@ -435,10 +488,33 @@ fn wait_readable(listeners: &[&UnixListener], limit: Duration) {
     };
 }
 
+thread_local! {
+    /// The connection this thread serves, when its client asked for progress lines.
+    static PROGRESS: RefCell<Option<UnixStream>> = const { RefCell::new(None) };
+}
+
+/// A step a command is on: in the daemon's log, and to the client when it asked for
+/// progress (only from the thread serving it; a lost line is no error).
+pub fn progress(line: &str) {
+    eprintln!("stew daemon: {line}");
+    PROGRESS.with(|p| {
+        if let Some(conn) = p.borrow_mut().as_mut() {
+            let _ = send(conn, &Reply::Progress { line: line.into() });
+        }
+    });
+}
+
 fn connection(hub: &Hub, conn: UnixStream, from_box: bool) -> std::io::Result<()> {
     // one line, of bounded size (a longer one reads as cut off)
     let reply = match recv::<Request>(&mut BufReader::new((&conn).take(stew_proto::MAX_REQUEST))) {
-        Ok(Some(req)) => hub.handle(req, from_box),
+        Ok(Some(req)) => {
+            if req.progress {
+                PROGRESS.with(|p| *p.borrow_mut() = conn.try_clone().ok());
+            }
+            let reply = hub.handle(req, from_box);
+            PROGRESS.with(|p| *p.borrow_mut() = None);
+            reply
+        }
         Ok(None) => return Ok(()),
         Err(e) => Reply::Error {
             kind: stew_proto::ErrorKind::Fail,
@@ -476,6 +552,7 @@ mod tests {
                 Request {
                     stew: Some(stew.into()),
                     token: Some("t".repeat(32)),
+                    progress: false,
                     call: Call::New {
                         repos: vec![],
                         title: "x".into(),

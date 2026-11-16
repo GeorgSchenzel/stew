@@ -660,6 +660,7 @@ fn the_token_and_what_a_stew_may_ask() {
     let req = |stew: Option<&str>, token: Option<&str>, call: Call| Request {
         stew: stew.map(String::from),
         token: token.map(String::from),
+        progress: false,
         call,
     };
     let refused = |r: Reply, what: &str| match r {
