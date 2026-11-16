@@ -474,9 +474,29 @@ impl Hub {
         });
     }
 
+    fn is_placed(&self, id: &str) -> bool {
+        let f = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        f.state.stews.contains_key(id)
+    }
+
+    /// `close` for a stew on no site: nothing to check or export, only its branch.
+    fn close_tracked(&self, config: &Config, id: &str) -> Result<Reply> {
+        id::check(id)?;
+        let _busy = self.busy(id)?;
+        progress(&format!("{id}: marking it closed on its notes branch"));
+        let mirror = self.mirror(config)?;
+        let _lock = self.mirror_lock();
+        mirror.ensure()?;
+        mirror.close(id, &id::today())?;
+        Ok(Reply::Done { warnings: vec![] })
+    }
+
     /// `remove`, and with `close` also `state: closed` and a LOG.md line.
     pub fn remove(&self, id: &str, force: bool, close: bool) -> Result<Reply> {
         let config = Config::load(&self.paths)?;
+        if close && !self.is_placed(id) {
+            return self.close_tracked(&config, id);
+        }
         let (placed, driver) = self.placed(&config, id)?;
         let _busy = self.busy(id)?;
         let t = target(id, &placed.token);

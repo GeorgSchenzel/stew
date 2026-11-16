@@ -289,6 +289,25 @@ fn new_remove_open_close() {
     let v = t.ls();
     assert_eq!(v["stews"][0]["state"], "removed");
     assert!(v["stews"][0].get("site").is_none());
+
+    // close on no site: only its branch, closed with a LOG line; out of ls
+    t.ok(&["close", &id]);
+    let snap = yaml(&t.tracked_file(&id, "stew.yaml"));
+    assert_eq!(snap["state"], "closed");
+    assert_eq!(snap["repos"][0]["branch"], "work", "the rest as it was");
+    let log = t.tracked_file(&id, "LOG.md");
+    assert!(log.trim_end().ends_with(" closed"), "{log}");
+    assert!(
+        t.tracked_file(&id, "README.md")
+            .contains("waiting: Georg looks")
+    );
+    assert!(!t.ok(&["ls"]).stdout.contains("Test it"));
+    let r = t.stew(&["close", &id]);
+    assert!(
+        r.code != 0 && r.stderr.contains("closed already"),
+        "{}",
+        r.stderr
+    );
     let r = t.stew(&["remove", &id]);
     assert!(
         r.code != 0 && r.stderr.contains("on no site"),
@@ -335,9 +354,10 @@ fn new_remove_open_close() {
     assert!(meta.get("closed").is_none());
     let log = t.tracked_file(&id, "LOG.md");
     assert!(log.trim_end().ends_with(" reopened"), "{log}");
+    // created, closed (on no site), reopened, closed, reopened
     assert_eq!(
         log.lines().filter(|l| l.starts_with("- ")).count(),
-        3,
+        5,
         "{log}"
     );
     assert_eq!(t.ls()["stews"][0]["state"], "running");

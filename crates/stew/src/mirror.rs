@@ -1,4 +1,5 @@
-//! The hub's bare mirror of the artifacts repo: claiming `stew/<id>` and `ls --all`.
+//! The hub's bare mirror of the artifacts repo: claiming `stew/<id>`, what `ls` reads, and
+//! closing a stew that is on no site.
 //!
 //! Claiming makes a stew's first commit (`stew.yaml`, `README.md`, `LOG.md`, and `BRIEF.md`
 //! with a brief) with
@@ -155,24 +156,82 @@ impl Mirror {
         }
         let tree = self.write(["mktree"], tree.as_bytes())?;
         let subject = format!("created: {}", meta.title);
-        let mut env = Vec::new();
-        if !git_ok(&self.dir, ["config", "user.name"])
-            || !git_ok(&self.dir, ["config", "user.email"])
-        {
-            env = vec![
-                ("GIT_AUTHOR_NAME", IDENTITY.0),
-                ("GIT_AUTHOR_EMAIL", IDENTITY.1),
-                ("GIT_COMMITTER_NAME", IDENTITY.0),
-                ("GIT_COMMITTER_EMAIL", IDENTITY.1),
-            ];
-        }
         let out = git_with(
             &self.dir,
             ["commit-tree", &tree, "-m", &subject],
-            &env,
+            &self.identity(),
             None,
         )?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// Closes a stew that is on no site, on its branch itself: `state: closed`, `closed:
+    /// <date>` and a LOG.md line, one commit on the branch's tip, pushed only if the remote
+    /// still has that tip (`--force-with-lease`). Fetches first.
+    pub fn close(&self, id: &str, date: &str) -> Result<()> {
+        self.fetch()?;
+        let refname = branch(id);
+        let old = git(&self.dir, ["rev-parse", "--verify", "--quiet", &refname])
+            .map_err(|_| fail!("no tracked stew {id}"))?;
+        let mut meta = parse_meta(&git(&self.dir, ["show", &format!("{old}:stew.yaml")])?)?;
+        if meta.id != id {
+            return Err(fail!("stew/{id}: its stew.yaml names {}", meta.id));
+        }
+        if meta.is_closed() {
+            return Err(fail!("{id} is closed already"));
+        }
+        meta.state = Some(stew_proto::Openness::Closed);
+        meta.closed = Some(date.to_string());
+        let mut log = git(&self.dir, ["show", &format!("{old}:LOG.md")]).unwrap_or_default();
+        if !log.is_empty() && !log.ends_with('\n') {
+            log.push('\n');
+        }
+        log.push_str(&format!("- {date} closed\n"));
+        // the tip's tree with the two files replaced
+        let mut entries: Vec<String> = git(&self.dir, ["ls-tree", &old])?
+            .lines()
+            .filter(|l| !l.ends_with("\tstew.yaml") && !l.ends_with("\tLOG.md"))
+            .map(String::from)
+            .collect();
+        for (name, content) in [("stew.yaml", meta_yaml(&meta)), ("LOG.md", log)] {
+            let sha = self.write(["hash-object", "-w", "--stdin"], content.as_bytes())?;
+            entries.push(format!("100644 blob {sha}\t{name}"));
+        }
+        let tree = self.write(["mktree"], format!("{}\n", entries.join("\n")).as_bytes())?;
+        let out = git_with(
+            &self.dir,
+            ["commit-tree", &tree, "-p", &old, "-m", "stew: closed"],
+            &self.identity(),
+            None,
+        )?;
+        let commit = String::from_utf8_lossy(&out).trim().to_string();
+        git(
+            &self.dir,
+            [
+                "push",
+                "--quiet",
+                &format!("--force-with-lease={refname}:{old}"),
+                "origin",
+                &format!("{commit}:{refname}"),
+            ],
+        )
+        .map_err(|e| fail!("cannot push the close of stew/{id}: {e}"))?;
+        git(&self.dir, ["update-ref", &refname, &commit])?;
+        Ok(())
+    }
+
+    /// stew's own author when git has no identity configured.
+    fn identity(&self) -> Vec<(&'static str, &'static str)> {
+        if git_ok(&self.dir, ["config", "user.name"]) && git_ok(&self.dir, ["config", "user.email"])
+        {
+            return vec![];
+        }
+        vec![
+            ("GIT_AUTHOR_NAME", IDENTITY.0),
+            ("GIT_AUTHOR_EMAIL", IDENTITY.1),
+            ("GIT_COMMITTER_NAME", IDENTITY.0),
+            ("GIT_COMMITTER_EMAIL", IDENTITY.1),
+        ]
     }
 
     fn write<const N: usize>(&self, args: [&str; N], input: &[u8]) -> Result<String> {

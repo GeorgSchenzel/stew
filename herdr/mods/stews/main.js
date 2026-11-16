@@ -111,14 +111,18 @@ export default class Stews extends View {
     cx.notify();
   }
 
-  // The row's menu, as a popup of this mod. It hands what was picked to the panel (the
-  // popup's own tasks end when it closes).
+  // The row's menu, as a popup of this mod: what fits its state. It hands what was picked
+  // to the panel (the popup's own tasks end when it closes).
   menuFor(s) {
-    const items = [];
+    const items = []; // [verb, label, doing, ask again first]
     if (s.state === "running") items.push(["stop", "Stop", "stopping"]);
-    if (s.site) items.push(["remove", "Remove from its site…", "removing"]);
-    if (!items.length) return;
-    openOverlay({ mod: "stews", kind: "popup", width: 240, height: 34 + items.length * 31, props: { menu: { stew: s, items } } });
+    if (s.site && s.state !== "running") items.push(["start", "Start", "starting"]);
+    if (!s.site) items.push(["open", s.state === "closed" ? "Reopen" : "Open", "opening"]);
+    if (s.site) items.push(["remove", "Remove from its site", "removing", "Click again to remove (pushed work only)"]);
+    if (s.state !== "closed") items.push(s.site
+      ? ["close", "Close", "closing", "Click again to remove and close"]
+      : ["close", "Close", "closing"]);
+    openOverlay({ mod: "stews", kind: "popup", width: 260, height: 34 + items.length * 31, props: { menu: { stew: s, items } } });
   }
 
   menu(t) {
@@ -129,16 +133,16 @@ export default class Stews extends View {
     };
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
       .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).truncate().child(stew.title || stew.id))
-      .children(items.map(([verb, label, doing]) => {
-        // removing deletes its box or dir (only once everything is pushed): a second click
-        const sure = verb !== "remove" || this.sure;
+      .children(items.map(([verb, label, doing, again]) => {
+        // what deletes a box or dir (only once everything is pushed) takes a second click
+        const armed = this.armed === verb;
         return h_flex().id(`menu-${verb}`).h(31).px(8).rounded(7).items_center()
-          .text_color(verb === "remove" && this.sure ? t.blocked : t.foreground).hover((el) => el.bg(t.hover))
+          .text_color(armed ? t.blocked : t.foreground).hover((el) => el.bg(t.hover))
           .on_click((_e, cx) => {
-            if (sure) ask(verb, doing);
-            else { this.sure = true; cx.notify(); }
+            if (!again || armed) ask(verb, doing);
+            else { this.armed = verb; cx.notify(); }
           })
-          .child(verb === "remove" && this.sure ? "Click again to remove (pushed work only)" : label);
+          .child(armed ? again : label);
       }));
   }
 

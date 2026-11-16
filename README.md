@@ -37,7 +37,8 @@ repo. See the plan (`agents-in-forests-vy32:plan.md`, section stew) for the desi
   --closed --json` every 5 s: the open ones by recency, then those closed in the last two
   weeks; each on two lines (the title and its short id; its state or agents' status, site
   and age), a running one's agents (and their sub-agents) under it, a play button for a stopped one (`stew
-  start`) or one on no site (`stew open`), and stop or remove on right-click.
+  start`) or one on no site (`stew open`), and on right-click what fits its state: start, stop, open or reopen, remove,
+  close (removing and closing a stew on a site take a second click).
   `services.stew.herdr.enable` links it into `~/.config/herdr-app/` (off by default); then
   `herdr-app do layout.switch '{"name":"stews"}'` once.
 
